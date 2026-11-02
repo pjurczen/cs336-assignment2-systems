@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 import torch
+
 from cs336_basics.bpe_tokenizer import BpeTokenizer
 from cs336_basics.checkpoint import upgrade_state_dict
 from cs336_basics.run_config import RunConfig
@@ -27,10 +28,11 @@ def decoding(args: argparse.Namespace):
         device=torch.device(args.device),
         dtype=torch.float32,
         tie_embeddings=model_config.model_tie_embeddings,
+        qk_norm=model_config.model_qk_norm,
+        logit_soft_cap=model_config.model_logit_soft_cap,
     )
 
-    checkpoint_path = args.checkpoint if args.checkpoint is not None else latest_checkpoint_path(
-        os.path.join(args.run_dir, "checkpoints"))
+    checkpoint_path = args.checkpoint if args.checkpoint is not None else latest_checkpoint_path(os.path.join(args.run_dir, "checkpoints"))
     print(f"Loading model from {checkpoint_path}...")
     # The run may have trained on another device (e.g. CUDA), so load straight onto the one we decode on.
     checkpoint: dict[str, any] = torch.load(checkpoint_path, map_location=args.device)
@@ -82,8 +84,7 @@ def latest_checkpoint_path(checkpoints_dir: str) -> str:
     return max(checkpoints, key=os.path.getmtime)
 
 
-def sample_next_token(logits: torch.Tensor, temperature: float, top_p: Optional[float] = None,
-                      top_k: Optional[int] = None) -> int:
+def sample_next_token(logits: torch.Tensor, temperature: float, top_p: Optional[float] = None, top_k: Optional[int] = None) -> int:
     if temperature == 0:
         return torch.argmax(logits).item()
     scaled_prediction: torch.Tensor = logits / temperature

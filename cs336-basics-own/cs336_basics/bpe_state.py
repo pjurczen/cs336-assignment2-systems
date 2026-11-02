@@ -1,8 +1,9 @@
 from collections import Counter, defaultdict
 
+from line_profiler import profile
+
 from cs336_basics.pretoken_counter import PretokenCounter
 from cs336_basics.pretokenization import merge_pretoken
-from line_profiler import profile
 
 
 class BpeState:
@@ -25,8 +26,7 @@ class BpeState:
                     counts[byte_pair] += count
         return counts
 
-    def _calculate_pairs_to_pretokens_index(self, pretoken_vocab: dict[tuple[bytes, ...], int]) -> dict[
-        tuple[bytes, bytes], set[tuple[bytes, ...]]]:
+    def _calculate_pairs_to_pretokens_index(self, pretoken_vocab: dict[tuple[bytes, ...], int]) -> dict[tuple[bytes, bytes], set[tuple[bytes, ...]]]:
         pairs_to_pretokens_index: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
         for pretoken in pretoken_vocab.keys():
             i: int = 0
@@ -73,8 +73,7 @@ class BpeState:
         return counts
 
     @classmethod
-    def get_count_deltas(cls, old_counts: dict[tuple[bytes, bytes], int], new_counts: dict[tuple[bytes, bytes], int]) -> \
-    dict[tuple[bytes, bytes], int]:
+    def get_count_deltas(cls, old_counts: dict[tuple[bytes, bytes], int], new_counts: dict[tuple[bytes, bytes], int]) -> dict[tuple[bytes, bytes], int]:
         count_deltas: dict[tuple[bytes, bytes], int] = new_counts.copy()
         for new_pair, new_count in new_counts.items():
             if new_pair in old_counts:

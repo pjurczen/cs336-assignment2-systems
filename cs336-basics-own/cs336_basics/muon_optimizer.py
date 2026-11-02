@@ -20,8 +20,7 @@ def newtonSchulz(G: torch.Tensor, a: float = 3.4445, b: float = -4.7750, c: floa
 
 class MuonOptimizer(torch.optim.Optimizer):
 
-    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float = 1e-3, weight_decay: float = 0.01,
-                 momentum: float = 0.95) -> None:
+    def __init__(self, params: Iterable[torch.nn.Parameter], lr: float = 1e-3, weight_decay: float = 0.01, momentum: float = 0.95) -> None:
         if lr < 0:
             raise ValueError(f"Invalid learning rate: {lr}")
         defaults = {"lr": lr, "weight_decay": weight_decay, "momentum": momentum}

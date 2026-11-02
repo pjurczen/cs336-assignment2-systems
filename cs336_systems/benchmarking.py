@@ -3,6 +3,7 @@ import statistics
 import timeit
 
 import torch
+
 from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.muon_optimizer import MuonOptimizer
@@ -22,6 +23,8 @@ def benchmark(args: argparse.Namespace):
         device=args.device,
         dtype=torch.float32,
         tie_embeddings=args.model_tie_embeddings,
+        qk_norm=args.model_qk_norm,
+        logit_soft_cap=args.model_logit_soft_cap,
     )
     if args.device.startswith("cuda"):
         # Let float32 matmuls run on TF32 tensor cores (A100 and newer).
@@ -64,7 +67,8 @@ def benchmark(args: argparse.Namespace):
     for i in range(1, args.w + args.n + 1):
 
         t0 = timeit.default_timer()
-        logits = model(inputs)
+        with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+            logits = model(inputs)
 
         synchronize(args.device)
         t1 = timeit.default_timer()
@@ -98,8 +102,13 @@ def benchmark(args: argparse.Namespace):
     print(f"Measurement iters: {args.n}")
 
     print(f"Forward pass: {statistics.mean(forward_timing) * 1000:.2f} ± {statistics.stdev(forward_timing) * 1000:.2f} ms")
+    print(f"Forward pass values: {forward_timing}")
+
     print(f"Backward pass: {statistics.mean(backward_timing) * 1000:.2f} ± {statistics.stdev(backward_timing) * 1000:.2f} ms")
+    print(f"Backward pass values: {backward_timing}")
+
     print(f"Optimizer step: {statistics.mean(optimizers_timing) * 1000:.2f} ± {statistics.stdev(optimizers_timing) * 1000:.2f} ms")
+    print(f"Optimizer step values: {optimizers_timing}")
 
 
 def synchronize(device: str):
@@ -143,6 +152,8 @@ if __name__ == "__main__":
     arg_parser.add_argument("--model_rope_theta", type=int_or_none, default=10000)
     arg_parser.add_argument("--model_tie_embeddings", action="store_true",
                             help="share one matrix between token embeddings and lm_head")
+    arg_parser.add_argument("--model_qk_norm", action="store_true", help="RMSNorm on each head's queries and keys, before RoPE")
+    arg_parser.add_argument("--model_logit_soft_cap", type=float, default=None, help="squash output logits to c * tanh(logits / c); unset turns it off")
     arg_parser.add_argument("--model_compile", action="store_true")
     arg_parser.add_argument("--gradient_max_l2_norm", type=float, default=1.0)
     arg_parser.add_argument("--gradient_eps", type=float, default=1e-6)

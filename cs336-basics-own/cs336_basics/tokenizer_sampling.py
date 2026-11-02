@@ -9,10 +9,8 @@ from random import Random
 import numpy as np
 from tests.test_tokenizer import get_tokenizer_from_vocab_merges_path
 
-TINY_STORIES_VOCAB_PATH = pathlib.Path(
-    __file__).resolve().parent / "../data/train-bpe-vocab-TinyStoriesV2-GPT4-train.json"
-TINY_STORIES_MERGES_PATH = pathlib.Path(
-    __file__).resolve().parent / "../data/train-bpe-merges-TinyStoriesV2-GPT4-train.txt"
+TINY_STORIES_VOCAB_PATH = pathlib.Path(__file__).resolve().parent / "../data/train-bpe-vocab-TinyStoriesV2-GPT4-train.json"
+TINY_STORIES_MERGES_PATH = pathlib.Path(__file__).resolve().parent / "../data/train-bpe-merges-TinyStoriesV2-GPT4-train.txt"
 TINY_STORIES_FILE_PATH = pathlib.Path(__file__).resolve().parent / "../data/TinyStoriesV2-GPT4-train.txt"
 
 OPEN_WEB_TEXT_VOCAB_PATH = pathlib.Path(__file__).resolve().parent / "../data/train-bpe-vocab-owt_train.json"
@@ -26,8 +24,7 @@ COMPRESSION_RATIO_SAMPLE_SIZE: int = 10
 ENCODING_FILE_LENGTH_SAMPLE_SIZE: int = 10 * 1024 * 1024  # 10MB
 
 
-def compression_ratio_sampling(vocab_path: os.PathLike, merges_path: os.PathLike, text_file_path: os.PathLike,
-                               special_token: str) -> None:
+def compression_ratio_sampling(vocab_path: os.PathLike, merges_path: os.PathLike, text_file_path: os.PathLike, special_token: str) -> None:
     tokenizer = get_tokenizer_from_vocab_merges_path(vocab_path, merges_path, [special_token])
     samples_compression_ratio: list[float] = []
     SEP: bytes = SPECIAL_TOKEN.encode('utf-8')
@@ -60,8 +57,7 @@ def compression_ratio_sampling(vocab_path: os.PathLike, merges_path: os.PathLike
 
 
 def measure_encoding_performance() -> None:
-    tokenizer = get_tokenizer_from_vocab_merges_path(OPEN_WEB_TEXT_VOCAB_PATH, OPEN_WEB_TEXT_MERGES_PATH,
-                                                     [SPECIAL_TOKEN])
+    tokenizer = get_tokenizer_from_vocab_merges_path(OPEN_WEB_TEXT_VOCAB_PATH, OPEN_WEB_TEXT_MERGES_PATH, [SPECIAL_TOKEN])
     with open(OPEN_WEB_TEXT_FILE_PATH, "rb") as file:
         total_size: int = file.seek(0, os.SEEK_END)
         p: int = random.randrange(total_size - ENCODING_FILE_LENGTH_SAMPLE_SIZE)
@@ -88,10 +84,8 @@ def encode_file():
 def print_decoded_sample():
     arr = np.load("data/owt_train_ids.npy", mmap_mode="r")
     print(len(arr))  # 2,727,321,299
-    tokenizer = get_tokenizer_from_vocab_merges_path(OPEN_WEB_TEXT_VOCAB_PATH, OPEN_WEB_TEXT_MERGES_PATH,
-                                                     [SPECIAL_TOKEN])
+    tokenizer = get_tokenizer_from_vocab_merges_path(OPEN_WEB_TEXT_VOCAB_PATH, OPEN_WEB_TEXT_MERGES_PATH, [SPECIAL_TOKEN])
     print(tokenizer.decode(arr[:200].tolist()))
-
 
 if __name__ == "__main__":
     # compression_ratio_sampling(TINY_STORIES_VOCAB_PATH, TINY_STORIES_MERGES_PATH, TINY_STORIES_FILE_PATH, SPECIAL_TOKEN)

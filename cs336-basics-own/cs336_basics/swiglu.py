@@ -8,8 +8,7 @@ class SwiGLU(torch.nn.Module):
     w2: Linear  # (d_model, d_ff)
     w3: Linear  # (d_ff, d_model)
 
-    def __init__(self, d_model: int, d_ff: int | None = None, device: torch.device | None = None,
-                 dtype: torch.dtype | None = None):
+    def __init__(self, d_model: int, d_ff: int | None = None, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
         if d_ff is None:
             d_ff = round(8 * d_model / 3 / 64) * 64

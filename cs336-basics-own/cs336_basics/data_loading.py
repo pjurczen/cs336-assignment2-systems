@@ -16,8 +16,7 @@ def get_nonoverlapping_indices(dataset: npt.NDArray, context_length: int, limit:
     return np.arange(count) * context_length
 
 
-def get_batch(dataset: npt.NDArray, indices: npt.NDArray[int], context_length: int, device: str,
-              dtype: torch.dtype | None = None) -> tuple[
+def get_batch(dataset: npt.NDArray, indices: npt.NDArray[int], context_length: int, device: str, dtype: torch.dtype | None = None) -> tuple[
     torch.Tensor, torch.Tensor]:
     indices = rearrange(indices, "... -> ... 1")
 

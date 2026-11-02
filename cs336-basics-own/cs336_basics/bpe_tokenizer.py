@@ -10,6 +10,7 @@ from collections.abc import Iterable, Iterator
 from functools import lru_cache
 
 import numpy as np
+
 from cs336_basics.bpe_state import BpeState
 from cs336_basics.common import gpt2_bytes_to_unicode
 from cs336_basics.peek_memory_sampler import PeekMemorySampler
@@ -76,8 +77,7 @@ class BpeTokenizer:
         return cls.from_resources(vocab, merges, special_tokens)
 
     @classmethod
-    def from_resources(cls, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]],
-                       special_tokens: list[str] | None = None) -> "BpeTokenizer":
+    def from_resources(cls, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None) -> "BpeTokenizer":
         bpe_tokenizer: BpeTokenizer = BpeTokenizer()
         bpe_tokenizer.merges = merges
         bpe_tokenizer.vocab = vocab

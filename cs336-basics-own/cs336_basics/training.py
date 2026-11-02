@@ -9,10 +9,11 @@ import numpy as np
 import numpy.typing as npt
 import torch.optim
 import wandb
+
 from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.bpe_tokenizer import read_tokenizer_config
 from cs336_basics.checkpoint import load_checkpoint, save_checkpoint
-from cs336_basics.cross_entropy import cross_entropy
+from cs336_basics.cross_entropy import cross_entropy, cross_entropy_z_loss
 from cs336_basics.data_loading import get_batch, get_random_indices, get_nonoverlapping_indices
 from cs336_basics.gradient import gradient_clipping
 from cs336_basics.learning_rate import cosine_lr_schedule, cosine_lr_schedule_by_time
@@ -31,8 +32,7 @@ def training(args: argparse.Namespace):
     print(f"Run directory: {run_dir}")
 
     # Live dashboard, off unless --wandb_project is given. Needs WANDB_API_KEY or a prior `wandb login`.
-    wandb_run = wandb.init(project=args.wandb_project, name=args.run_name,
-                           config=vars(args)) if args.wandb_project else None
+    wandb_run = wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args)) if args.wandb_project else None
 
     model: torch.nn.Module = TransformerLM(
         vocab_size=args.model_vocab_size,
@@ -46,6 +46,8 @@ def training(args: argparse.Namespace):
         device=args.device,
         dtype=torch.float32,
         tie_embeddings=args.model_tie_embeddings,
+        qk_norm=args.model_qk_norm,
+        logit_soft_cap=args.model_logit_soft_cap,
     )
     if args.device.startswith("cuda"):
         # Let float32 matmuls run on TF32 tensor cores (A100 and newer).
@@ -92,8 +94,7 @@ def training(args: argparse.Namespace):
 
     iter_val_indices: npt.NDArray[int] = get_nonoverlapping_indices(val_dataset, args.model_context_length,
                                                                     args.val_batches * args.batch_size) if args.val_data else None
-    final_val_indices: npt.NDArray[int] = get_nonoverlapping_indices(val_dataset,
-                                                                     args.model_context_length) if args.val_data else None
+    final_val_indices: npt.NDArray[int] = get_nonoverlapping_indices(val_dataset, args.model_context_length) if args.val_data else None
 
     with open(os.path.join(run_dir, "metrics.jsonl"), "a") as metric_file:
 
@@ -103,30 +104,27 @@ def training(args: argparse.Namespace):
 
         # With a time budget, training ends when it's used up (minus the reserve for the final validation and checkpoint),
         # and the cosine follows the elapsed time instead of the step count. --iter is then only an upper limit.
-        budget_seconds = (
-                                     args.time_budget_minutes - args.time_reserve_minutes) * 60 if args.time_budget_minutes is not None else None
+        budget_seconds = (args.time_budget_minutes - args.time_reserve_minutes) * 60 if args.time_budget_minutes is not None else None
 
         for it in range(iteration, args.iter + 1):
             elapsed = time.perf_counter() - t0  # no synchronize: the CPU runs only a few steps ahead of the GPU
             last_step = it == args.iter or (budget_seconds is not None and elapsed >= budget_seconds)
 
-            indices: npt.NDArray[int] = get_random_indices(dataset=train_dataset, batch_size=args.batch_size,
-                                                           context_length=args.model_context_length)
-            inputs, targets = get_batch(dataset=train_dataset, indices=indices,
-                                        context_length=args.model_context_length, device=args.device, dtype=torch.long)
+            indices: npt.NDArray[int] = get_random_indices(dataset=train_dataset, batch_size=args.batch_size, context_length=args.model_context_length)
+            inputs, targets = get_batch(dataset=train_dataset, indices=indices, context_length=args.model_context_length, device=args.device, dtype=torch.long)
             with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
                 prediction: torch.Tensor = compiled_model(inputs)
 
                 # No float32 copy of the logits here: it costs batch × context × vocab × 4 bytes (3.9 GiB at 64 × 512 × 32K).
                 # Autocast still runs exp, log and sum in float32. evaluate() keeps the copy, since it holds no activations.
-                loss: torch.Tensor = cross_entropy(prediction, targets)
+                cross_entropy_loss, z_loss = cross_entropy_z_loss(prediction, targets, lambda_w=args.z_loss_weight)
+                loss = cross_entropy_loss + z_loss
             loss.backward()
 
-            l2_norm: torch.Tensor = gradient_clipping(parameters=model.parameters(),
-                                                      max_l2_norm=args.gradient_max_l2_norm, eps=args.gradient_eps)
+            l2_norm: torch.Tensor = gradient_clipping(parameters=model.parameters(), max_l2_norm=args.gradient_max_l2_norm, eps=args.gradient_eps)
 
             if (it <= args.optimizer_warmup_iters and it % 10 == 0) or it % args.log_interval == 0 or last_step:
-                print(f"{it}/{args.iter} Training loss: {loss.item()}")
+                print(f"{it}/{args.iter} Training loss: {cross_entropy_loss.item()}")
             if it % (10 * args.log_interval) == 0 or last_step:
                 print(f"{it}/{args.iter} L2-norm: {l2_norm.item()}")
 
@@ -160,8 +158,7 @@ def training(args: argparse.Namespace):
                 print(f"Elapsed time: {(t1 - t0):.0f} s")
 
                 metrics: dict = {
-                    "step": it, "time": round(t1 - t0, 2), "train_loss": loss.item(), "lr": lr,
-                    "grad_norm": l2_norm.item(),
+                    "step": it, "time": round(t1 - t0, 2), "train_loss": cross_entropy_loss.item(), "lr": lr, "grad_norm": l2_norm.item(),
                     "peak_memory_gb": peak_memory_gb(args.device),
                 }
                 metric_file.write(json.dumps(metrics) + "\n")
@@ -170,12 +167,10 @@ def training(args: argparse.Namespace):
 
             if val_dataset is not None and (it % args.val_interval == 0 or last_step):
                 if last_step:
-                    val_loss: float = evaluate(compiled_model, val_dataset, final_val_indices, args.batch_size,
-                                               args.model_context_length, args.device,
+                    val_loss: float = evaluate(compiled_model, val_dataset, final_val_indices, args.batch_size, args.model_context_length, args.device,
                                                bf16=args.bf16, full_dataset_eval=True)
                 elif it % args.val_interval == 0:
-                    val_loss: float = evaluate(compiled_model, val_dataset, iter_val_indices, args.batch_size,
-                                               args.model_context_length, args.device,
+                    val_loss: float = evaluate(compiled_model, val_dataset, iter_val_indices, args.batch_size, args.model_context_length, args.device,
                                                bf16=args.bf16)
                 t2 = time.perf_counter()
 
@@ -200,8 +195,7 @@ def training(args: argparse.Namespace):
         wandb_run.finish()
 
 
-def evaluate(model: torch.nn.Module, dataset: npt.NDArray, indices: npt.NDArray, batch_size: int, context_length: int,
-             device: str,
+def evaluate(model: torch.nn.Module, dataset: npt.NDArray, indices: npt.NDArray, batch_size: int, context_length: int, device: str,
              bf16: bool = False, full_dataset_eval: bool = False) -> float:
     with torch.no_grad():
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=bf16):
@@ -209,20 +203,17 @@ def evaluate(model: torch.nn.Module, dataset: npt.NDArray, indices: npt.NDArray,
             token_count: int = 0
             for idx in range(0, len(indices), batch_size):
                 batch = indices[idx: (idx + batch_size)]
-                val_inputs, val_targets = get_batch(dataset=dataset, indices=batch, context_length=context_length,
-                                                    device=device, dtype=torch.long)
+                val_inputs, val_targets = get_batch(dataset=dataset, indices=batch, context_length=context_length, device=device, dtype=torch.long)
 
                 val_prediction = model(val_inputs)
-                val_loss_sum += cross_entropy(val_prediction.float(), val_targets).item() * (
-                            len(batch) * context_length)
+                val_loss_sum += cross_entropy(val_prediction.float(), val_targets).item() * (len(batch) * context_length)
                 token_count += len(batch) * context_length
 
             if full_dataset_eval:
                 tail_length: int = (len(dataset) - 1) % context_length
                 if tail_length > 0:
                     start = len(dataset) - 1 - tail_length
-                    val_inputs, val_targets = get_batch(dataset=dataset, indices=np.array([start]),
-                                                        context_length=tail_length, device=device, dtype=torch.long)
+                    val_inputs, val_targets = get_batch(dataset=dataset, indices=np.array([start]), context_length=tail_length, device=device, dtype=torch.long)
                     val_prediction = model(val_inputs)
                     val_loss_sum += cross_entropy(val_prediction.float(), val_targets).item() * tail_length
                     token_count += tail_length
@@ -249,8 +240,7 @@ def peak_memory_gb(device: str) -> float | None:
 def log_to_wandb(wandb_run, metrics: dict):
     # Same metrics as metrics.jsonl; wandb takes the step separately and skips missing values.
     if wandb_run is not None:
-        wandb_run.log({key: value for key, value in metrics.items() if key != "step" and value is not None},
-                      step=metrics["step"])
+        wandb_run.log({key: value for key, value in metrics.items() if key != "step" and value is not None}, step=metrics["step"])
 
 
 def git_commit() -> str | None:
@@ -258,8 +248,7 @@ def git_commit() -> str | None:
     if os.environ.get("GIT_COMMIT"):
         return os.environ["GIT_COMMIT"]
     try:
-        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                                check=True).stdout.strip()
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         dirty = subprocess.run(["git", "diff", "--quiet", "HEAD", "--"]).returncode != 0
     except (OSError, subprocess.CalledProcessError):
         return None
@@ -281,8 +270,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--optimizer_beta1", type=float, default=0.9)
     arg_parser.add_argument("--optimizer_beta2", type=float, default=0.999)
     arg_parser.add_argument("--optimizer_eps", type=float, default=1e-8)
-    arg_parser.add_argument("--optimizer_muon", action="store_true",
-                            help="Muon for the 2D matrices inside the blocks, AdamW for the rest")
+    arg_parser.add_argument("--optimizer_muon", action="store_true", help="Muon for the 2D matrices inside the blocks, AdamW for the rest")
     arg_parser.add_argument("--model_context_length", type=int, default=1024)
     arg_parser.add_argument("--model_num_layers", type=int, default=48)
     arg_parser.add_argument("--model_d_model", type=int, default=1600)
@@ -290,10 +278,12 @@ if __name__ == "__main__":
     arg_parser.add_argument("--model_num_heads", type=int, default=25)
     arg_parser.add_argument("--model_eps", type=float, default=1e-5)
     arg_parser.add_argument("--model_rope_theta", type=int_or_none, default=10000)
-    arg_parser.add_argument("--model_tie_embeddings", action="store_true",
-                            help="share one matrix between token embeddings and lm_head")
+    arg_parser.add_argument("--model_tie_embeddings", action="store_true", help="share one matrix between token embeddings and lm_head")
+    arg_parser.add_argument("--model_qk_norm", action="store_true", help="RMSNorm on each head's queries and keys, before RoPE")
+    arg_parser.add_argument("--model_logit_soft_cap", type=float, default=None, help="squash output logits to c * tanh(logits / c); unset turns it off")
     arg_parser.add_argument("--gradient_max_l2_norm", type=float, default=1.0)
     arg_parser.add_argument("--gradient_eps", type=float, default=1e-6)
+    arg_parser.add_argument("--z_loss_weight", type=float, default=0.0, help="weight of the z-loss added to the training loss; 0 turns it off")
     arg_parser.add_argument("--iter", type=int, default=100)
     arg_parser.add_argument("--device", type=str, default="mps")
     arg_parser.add_argument("--batch_size", type=int, default=32)
@@ -317,8 +307,7 @@ if __name__ == "__main__":
     args.git_commit = git_commit()  # recorded in config.json and the wandb config
 
     if args.time_budget_minutes is not None and args.optimizer_warmup_iters is None:
-        arg_parser.error(
-            "--time_budget_minutes needs an explicit --optimizer_warmup_iters (the step count isn't known in advance)")
+        arg_parser.error("--time_budget_minutes needs an explicit --optimizer_warmup_iters (the step count isn't known in advance)")
     if args.optimizer_warmup_iters is None:
         args.optimizer_warmup_iters = args.iter // 50
     if args.optimizer_cosine_cycle_iters is None:
