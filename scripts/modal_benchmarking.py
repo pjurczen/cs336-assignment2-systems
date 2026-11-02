@@ -1,11 +1,7 @@
 """Runs a training command on a Modal B200, the leaderboard's GPU. Run from the repo root:
 
-    uv run modal run --detach scripts/modal_train.py --dataset owt-32k --args "--device cuda --run_name ... <training.py flags>"
-    uv run modal run scripts/modal_train.py::check     # builds the image and checks the environment, without a GPU
-
-Data and tokenizers live in the Modal volume cs336-data (data/<dataset>/, tokenizers/<name>/), uploaded once with
-`modal volume put`. Finished runs are saved there under runs/<run_name>/; fetch them with
-`modal volume get cs336-data runs/<run_name> runs/modal/`. --detach keeps the run going if this terminal closes.
+    uv run modal run --detach scripts/modal_benchmarking.py --args "--device cuda --run_name ... <benchmarking.py flags>"
+    uv run modal run scripts/modal_benchmarking.py::check     # builds the image and checks the environment, without a GPU
 
 modal is a dev dependency of the project. Only modal is imported at the top: everything else runs remotely in the image,
 so this file must not need torch or the project's modules locally.
@@ -18,7 +14,9 @@ PROJECT_DIR = "/root/project"
 
 image = (
     modal.Image.debian_slim(python_version="3.13")
-    .apt_install("gcc", "libc6-dev")  # torch.compile's Triton compiles a small C helper at runtime
+    .apt_install("gcc", "libc6-dev", "wget")  # torch.compile's Triton compiles a small C helper at runtime
+    .run_commands(
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb && dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update -qq && apt-get install -y -qq --no-install-recommends nsight-systems-2026.3.2")
     .uv_sync(extra_options="--no-dev --no-install-local")  # the locked dependencies, Linux torch built for CUDA 13
     # expandable_segments lets PyTorch's allocator join scattered free memory, so a large batch doesn't fail on
     # fragmentation (an A100 run once ran out of memory with 4.2 GiB reserved but unusable).
@@ -31,7 +29,7 @@ app = modal.App("cs336-train", image=image)
 
 
 @app.function(gpu=GPU, timeout=TIMEOUT_MINUTES * 60, volumes={"/vol": volume}, secrets=[modal.Secret.from_name("wandb")])
-def train(dataset: str, args: list[str], git_commit: str):
+def benchmark(args: list[str], git_commit: str):
     import os
     import shutil
     import subprocess
@@ -50,7 +48,7 @@ def train(dataset: str, args: list[str], git_commit: str):
             shutil.copytree("runs", "/vol/runs", dirs_exist_ok=True)
             volume.commit()
     if returncode != 0:
-        raise RuntimeError(f"training.py exited with code {returncode}")
+        raise RuntimeError(f"benchmarking.py exited with code {returncode}")
 
 
 @app.function(timeout=10 * 60)
@@ -65,7 +63,7 @@ def check():
 
 
 @app.local_entrypoint()
-def main(dataset: str, args: str, gpu: str = GPU):
+def main(args: str, gpu: str = GPU):
     """--gpu B200+ lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones."""
     import shlex
     import subprocess
@@ -74,4 +72,4 @@ def main(dataset: str, args: str, gpu: str = GPU):
     git_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"]).returncode != 0:
         git_commit += "-dirty"
-    train.with_options(gpu=gpu).remote(dataset, shlex.split(args), git_commit)
+    benchmark.with_options(gpu=gpu).remote(shlex.split(args), git_commit)
