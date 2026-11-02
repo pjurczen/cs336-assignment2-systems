@@ -1,7 +1,7 @@
 """Runs a training command on a Modal B200, the leaderboard's GPU. Run from the repo root:
 
-    uv run modal run --detach scripts/modal_benchmarking.py --args "--device cuda --run_name ... <benchmarking.py flags>"
-    uv run modal run scripts/modal_benchmarking.py::check     # builds the image and checks the environment, without a GPU
+    uv run modal run --detach scripts/modal_benchmark.py --args "--device cuda --run_name ... <benchmark.py flags>"
+    uv run modal run scripts/modal_benchmark.py::check     # builds the image and checks the environment, without a GPU
 
 modal is a dev dependency of the project. Only modal is imported at the top: everything else runs remotely in the image,
 so this file must not need torch or the project's modules locally.
@@ -11,6 +11,8 @@ import modal
 GPU = "B200"
 TIMEOUT_MINUTES = 60  # hard stop; training.py's --time_budget_minutes should end the run well before
 PROJECT_DIR = "/root/project"
+# Summary tables exported as CSV next to each nsys report (nsys stats doesn't run on macOS).
+NSYS_STATS_REPORTS = ["cuda_gpu_kern_sum", "cuda_gpu_trace", "cuda_api_sum", "cuda_kern_exec_sum", "nvtx_sum", "nvtx_gpu_proj_sum", "nvtx_kern_sum"]
 
 image = (
     modal.Image.debian_slim(python_version="3.13")
@@ -29,11 +31,12 @@ app = modal.App("cs336-train", image=image)
 
 
 @app.function(gpu=GPU, timeout=TIMEOUT_MINUTES * 60, volumes={"/vol": volume}, secrets=[modal.Secret.from_name("wandb")])
-def benchmark(args: list[str], git_commit: str):
+def benchmark(nsys_args: list[str], args: list[str], git_commit: str):
     import os
     import shutil
     import subprocess
     import sys
+    import glob
 
     os.chdir(PROJECT_DIR)
     # Local copies, like on Vertex: np.memmap reads small random pieces, which is slow over a network volume.
@@ -41,14 +44,20 @@ def benchmark(args: list[str], git_commit: str):
 
     returncode = 1
     try:
-        returncode = subprocess.run([sys.executable, "cs336_systems/benchmarking.py", *args], env=dict(os.environ, GIT_COMMIT=git_commit)).returncode
+        prefix = ["nsys", "profile", *nsys_args] if nsys_args else []
+        os.makedirs("runs/nsys", exist_ok=True)
+        # --nvtx-capture only matches registered NVTX strings by default; torch.cuda.nvtx sends plain ones.
+        returncode = subprocess.run([*prefix, sys.executable, "cs336_systems/benchmark.py", *args], env=dict(os.environ, GIT_COMMIT=git_commit, NSYS_NVTX_PROFILER_REGISTER_ONLY="0")).returncode
+        for report in glob.glob("runs/nsys/*.nsys-rep"):
+            stem = report.removesuffix(".nsys-rep")
+            subprocess.run(["nsys", "stats", "--report", ",".join(NSYS_STATS_REPORTS), "--format", "csv", "--output", stem, report], check=False)
     finally:
         # Save whatever the run produced, also when it failed.
         if os.path.isdir("runs"):
             shutil.copytree("runs", "/vol/runs", dirs_exist_ok=True)
             volume.commit()
     if returncode != 0:
-        raise RuntimeError(f"benchmarking.py exited with code {returncode}")
+        raise RuntimeError(f"benchmark.py exited with code {returncode}")
 
 
 @app.function(timeout=10 * 60)
@@ -63,7 +72,7 @@ def check():
 
 
 @app.local_entrypoint()
-def main(args: str, gpu: str = GPU):
+def main(args: str, gpu: str = GPU, nsys_args: str = ""):
     """--gpu B200+ lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones."""
     import shlex
     import subprocess
@@ -72,4 +81,4 @@ def main(args: str, gpu: str = GPU):
     git_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"]).returncode != 0:
         git_commit += "-dirty"
-    benchmark.with_options(gpu=gpu).remote(shlex.split(args), git_commit)
+    benchmark.with_options(gpu=gpu).remote(shlex.split(nsys_args), shlex.split(args), git_commit)

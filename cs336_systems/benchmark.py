@@ -1,13 +1,38 @@
 import argparse
+import contextlib
+import math
 import statistics
 import timeit
 
 import torch
+import torch.cuda.nvtx as nvtx
+from einops import einsum
+from jaxtyping import Bool, Float
 
+import cs336_basics.attention
 from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.muon_optimizer import MuonOptimizer
+from cs336_basics.softmax import softmax
 from cs336_basics.transformer_lm import TransformerLM
+
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+        Q: Float[torch.Tensor, " ... queries d_k"],
+        K: Float[torch.Tensor, " ... keys d_k"],
+        V: Float[torch.Tensor, " ... keys d_v"],
+        mask: Bool[torch.Tensor, " ... queries keys"] | None
+) -> Float[torch.Tensor, " ... seq_len d_v"]:
+    d_k = Q.shape[-1]
+    with nvtx.range("computing attention scores"):
+        qk = einsum(Q, K, "... queries d_k, ... keys d_k -> ... queries keys") / math.sqrt(d_k)  # => [FLOPs] (b, n, d) @ (b, n, d) = 2bn²d
+    if mask is not None:
+        qk = qk.masked_fill(~mask, float("-Inf"))
+    with nvtx.range("computing softmax"):
+        qk = softmax(qk, dim=-1)
+    with nvtx.range("final matmul"):
+        return einsum(qk, V, "... queries keys, ... keys d_v -> ... queries d_v")  # => [FLOPs] (b, n, n) @ (b, n, d) = 2bn²d
 
 
 def benchmark(args: argparse.Namespace):
@@ -34,6 +59,10 @@ def benchmark(args: argparse.Namespace):
     compile_backend: str = "inductor" if args.device.startswith("cuda") else "aot_eager"
     # Forward passes go through the compiled wrapper; checkpoints use the plain model so keys have no "_orig_mod." prefix.
     model: torch.nn.Module = torch.compile(raw_model, backend=compile_backend) if args.model_compile else raw_model
+
+    # Monkey-patch for profiling
+    if args.device.startswith("cuda"):
+        cs336_basics.attention.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
     matrix_params = []
@@ -64,39 +93,53 @@ def benchmark(args: argparse.Namespace):
     backward_timing = []
     optimizers_timing = []
 
-    for i in range(1, args.w + args.n + 1):
-
-        t0 = timeit.default_timer()
+    for i in range(1, args.w + 1):
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
             logits = model(inputs)
 
-        synchronize(args.device)
-        t1 = timeit.default_timer()
-
         loss: torch.Tensor = cross_entropy(logits, targets)
-
-        synchronize(args.device)
-        t2 = timeit.default_timer()
-
         loss.backward()
-
-        synchronize(args.device)
-        t3 = timeit.default_timer()
 
         for optimizer in optimizers:
             optimizer.step()
             optimizer.zero_grad()
 
-        synchronize(args.device)
-        t4 = timeit.default_timer()
+        if i == args.w:
+            print("Warmup done")
 
-        if i > args.w:
+    synchronize(args.device)
+
+    with nvtx_profiling("measure", args.device):
+        for i in range(1, args.n + 1):
+
+            t0 = timeit.default_timer()
+            with nvtx_profiling("forward", args.device):
+                with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                    logits = model(inputs)
+                synchronize(args.device)
+
+            t1 = timeit.default_timer()
+            with nvtx_profiling("loss", args.device):
+                loss: torch.Tensor = cross_entropy(logits, targets)
+                synchronize(args.device)
+
+            t2 = timeit.default_timer()
+            with nvtx_profiling("backward", args.device):
+                loss.backward()
+                synchronize(args.device)
+
+            t3 = timeit.default_timer()
+            with nvtx_profiling("optimizer", args.device):
+                for optimizer in optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                synchronize(args.device)
+
+            t4 = timeit.default_timer()
+
             forward_timing.append(t1 - t0)
             backward_timing.append(t3 - t2)
             optimizers_timing.append(t4 - t3)
-
-        if i == args.w:
-            print("Warmup done")
 
     print(f"Warmup iters: {args.w}")
     print(f"Measurement iters: {args.n}")
@@ -109,6 +152,10 @@ def benchmark(args: argparse.Namespace):
 
     print(f"Optimizer step: {statistics.mean(optimizers_timing) * 1000:.2f} ± {statistics.stdev(optimizers_timing) * 1000:.2f} ms")
     print(f"Optimizer step values: {optimizers_timing}")
+
+
+def nvtx_profiling(range_name: str, device: str):
+    return nvtx.range(range_name) if device.startswith("cuda") else contextlib.nullcontext()
 
 
 def synchronize(device: str):

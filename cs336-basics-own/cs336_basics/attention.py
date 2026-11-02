@@ -1,6 +1,7 @@
 import math
 
 import torch
+from einops import einsum, rearrange
 from jaxtyping import Bool, Float
 
 from cs336_basics.linear import Linear
@@ -21,10 +22,6 @@ def scaled_dot_product_attention(
         qk = qk.masked_fill(~mask, float("-Inf"))
     qk = softmax(qk, dim=-1)
     return einsum(qk, V, "... queries keys, ... keys d_v -> ... queries d_v")  # => [FLOPs] (b, n, n) @ (b, n, d) = 2bn²d
-
-
-import torch
-from einops import einsum, rearrange
 
 
 class CasualMultiHeadSelfAttention(torch.nn.Module):
