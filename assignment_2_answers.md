@@ -137,3 +137,54 @@ Pytorch is upcasting the value 0.0100021 to fp32 for us when we're doing the add
 accumulator=fp32, addend=fp16->upcast fp32:     tensor(10.0021)
 Here it does not matter if we upcast manually or not, pytorch would upcast automatically based on the accumulator type, we already created 0.0100021 as our representation of 0.01 in fp16,
 and we're storing it in higher precision fp32, also resulting in same error accumulating 1000 times.
+
+## 2.1.5 Problem (benchmarking_mixed_precision): Benchmarking Mixed Precision
+
+**(a)**
+
+1. fp32, model parameters are never autocasted
+2. fp16, linear layer output can be autocasted to fp16
+3. fp32, layer_norm can only be autocasted to fp32
+4. fp16, linear layer output can be autocasted fo tp16
+5. fp32, cross_entropy can only be autocasted to fp32
+6. fp32, grad has always same dtype as parameters
+
+**(b)**
+
+So LayerNorm is:
+mean = (1/d) · Σ xᵢ
+var = (1/d) · Σ (xᵢ − mean)²
+y = (x − mean) / √(var + ε) · γ + β,
+
+mean:
+
+- adding small values accumulates to a significant rounding error over many elements with fp16 precision - precision problem
+- sum can overflow before dividing
+
+var
+
+- subtracting mean from every element for large values results in cancellation - precision problem
+- sum can overflow
+- squaring it can result in value exceeding range of fp16 - overflow
+
+y
+
+- subtracting mean can result in cancellation - precision problem
+- adding epsilon can result in value not changing at all (absorption) - precision problem
+- dividing can result in overflow if the denominator is small
+
+With BF16 the range issues (overflow/underflow) are solved, since its same range as fp32, but the precision problems are even bigger, so to fix those we would need to upcast those operations to fp32
+(the accumulator needs to be in fp32 like in our experiment in mixed_precision_accumulation problem).
+
+**(c)**
+
+| model (ctx 512, batch 4) | GPU       | forward fp32 (ms) | forward bf16 (ms) | speedup | backward fp32 (ms) | backward bf16 (ms) | speedup |
+|--------------------------|-----------|-------------------|-------------------|---------|--------------------|--------------------|---------|
+| small                    | A100 SXM4 | 22.97 ± 0.19      | 24.84 ± 0.47      | 0.92×   | 40.02 ± 0.34       | 35.89 ± 2.19       | 1.12×   |
+| medium                   | A100 SXM4 | 49.32 ± 1.14      | 45.95 ± 0.29      | 1.07×   | 110.55 ± 0.91      | 92.85 ± 0.74       | 1.19×   |
+| large                    | A100 SXM4 | 92.42 ± 0.11      | 101.22 ± 5.37     | 0.91×   | 212.39 ± 0.24      | 170.58 ± 0.48      | 1.25×   |
+| xl                       | A100 SXM4 | 198.24 ± 2.66     | 156.26 ± 0.21     | 1.27×   | 466.42 ± 4.35      | 339.73 ± 1.06      | 1.37×   |
+
+We can see a steady speedup in backward pass. Forward pass speedup is not so steady and is varying depending on the model size, that is likely caused by overhead added by the extra kernels from
+autocast
+while only giving speedups in minority of time that matmuls take in the forward pass itself.
