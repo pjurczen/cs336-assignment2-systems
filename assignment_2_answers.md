@@ -207,4 +207,11 @@ For 2048 context length we can see big memory peaks from the attention blocks si
 
 Training run with 2048 context crashes with OutOfMemoryError during forward pass, since activations with such big context length exceed our maximum memory.
 
+**(b)**
 
+| Context length | Forward pass peak memory (GiB) | Full training peak memory (GiB) |
+|----------------|--------------------------------|---------------------------------|
+| 128            | 12.8                           | 51.3                            |
+| 2048           | 21.6                           | 78.5                            |
+
+I ran my experiments on A100-80GiB, therefore it crashed around 80GiB.
