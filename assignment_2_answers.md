@@ -112,3 +112,28 @@ from 8.7% to 5.2% and copy increases from 4.1% to 5.7%.
 | softmax                                | 0.063 GFLOP | 364.1 µs | ~0.17 TFLOP/s       |
 
 Softmax contributes ~50x less FLOPs but takes ~3.7x more time. What's interesting is also that in QKᵀ / √dₖ the element-wise division takes more time (54.6%) than the matmul itself (45.4%).
+
+## 2.1.5 Problem (mixed_precision_accumulation): Mixed-Precision Accumulation
+
+So first thing to notice is, by adding from 0.01 1000 times, we cross multiple float exponents, resulting in different spacing.
+This results in different accumulating error depending on the accumulator and the addend.
+
+The results are as following:
+
+accumulator=fp32, addend=fp32:                  tensor(10.0001)
+Spacing eg. in 8-16 range for fp32 is 0.00000095, adding 0.01 (0.0099999998 in fp32) produces error, since accumulator is of same precision,
+these small rounding error get dragged through different exponent ranges, so it accumulates and we receive 10.0001.
+
+accumulator=fp16, addend=fp16:                  tensor(9.9531, dtype=torch.float16)
+Spacing eg. in 8-16 range for fp16 is 0.0078125, adding 0.01 (0.0100021 in fp16) 250 times (we reach ~8 after 750 additions already because of 0.039 spacing in [4, 8) range of fp16,
+resulting in rounding of 0.01 to 0.0117) accumulates error of −0.547, resulting in total error of −0.049. Previous coarser ranges in lower exponents made the value higher than expected,
+the rounding error was positive of +0.498 and went to a negative one when arriving at 1000 additions.
+
+accumulator=fp32, addend=fp16:                  tensor(10.0021)
+In this case we're adding each time 0.0100021 (fp16 representation of 0.01) 1000 times, but fp32 is capable of storing finer grained values, so this error simply accumulates 1000 times and we land at
+10.0021.
+Pytorch is upcasting the value 0.0100021 to fp32 for us when we're doing the addition.
+
+accumulator=fp32, addend=fp16->upcast fp32:     tensor(10.0021)
+Here it does not matter if we upcast manually or not, pytorch would upcast automatically based on the accumulator type, we already created 0.0100021 as our representation of 0.01 in fp16,
+and we're storing it in higher precision fp32, also resulting in same error accumulating 1000 times.
