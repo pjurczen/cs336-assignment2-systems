@@ -1,13 +1,16 @@
 import argparse
 import contextlib
 import math
+import os
 import statistics
 import timeit
+from datetime import datetime
 
 import torch
 import torch.cuda.nvtx as nvtx
 from einops import einsum
 from jaxtyping import Bool, Float
+from torch import OutOfMemoryError
 
 import cs336_basics.attention
 from cs336_basics.adamw_optimizer import AdamWOptimizer
@@ -95,65 +98,90 @@ def benchmark(args: argparse.Namespace):
 
     for i in range(1, args.w + 1):
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
-            logits = model(inputs)
+            with torch.no_grad() if args.forward_only else contextlib.nullcontext():
+                logits = model(inputs)
+            if not args.forward_only:
+                loss: torch.Tensor = cross_entropy(logits, targets)
 
-            loss: torch.Tensor = cross_entropy(logits, targets)
+        if not args.forward_only:
+            loss.backward()
 
-        loss.backward()
-
-        for optimizer in optimizers:
-            optimizer.step()
-            optimizer.zero_grad()
+            for optimizer in optimizers:
+                optimizer.step()
+                optimizer.zero_grad()
 
         if i == args.w:
             print("Warmup done")
 
     synchronize(args.device)
 
-    with nvtx_profiling("measure", args.device):
-        for i in range(1, args.n + 1):
+    if args.memory_profile and args.device.startswith("cuda"):
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
-            t0 = timeit.default_timer()
-            with nvtx_profiling("forward", args.device):
-                with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
-                    logits = model(inputs)
-                synchronize(args.device)
+    oom_error = None
+    try:
+        with nvtx_profiling("measure", args.device):
+            for i in range(1, args.n + 1):
 
-            t1 = timeit.default_timer()
-            with nvtx_profiling("loss", args.device):
-                with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
-                    loss: torch.Tensor = cross_entropy(logits, targets)
-                synchronize(args.device)
+                t0 = timeit.default_timer()
+                with nvtx_profiling("forward", args.device):
+                    with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                        with torch.no_grad() if args.forward_only else contextlib.nullcontext():
+                            logits = model(inputs)
+                    synchronize(args.device)
 
-            t2 = timeit.default_timer()
-            with nvtx_profiling("backward", args.device):
-                loss.backward()
-                synchronize(args.device)
+                t1 = timeit.default_timer()
+                if not args.forward_only:
+                    with nvtx_profiling("loss", args.device):
+                        with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                            loss: torch.Tensor = cross_entropy(logits, targets)
+                        synchronize(args.device)
 
-            t3 = timeit.default_timer()
-            with nvtx_profiling("optimizer", args.device):
-                for optimizer in optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                synchronize(args.device)
+                    t2 = timeit.default_timer()
+                    with nvtx_profiling("backward", args.device):
+                        loss.backward()
+                        synchronize(args.device)
 
-            t4 = timeit.default_timer()
+                    t3 = timeit.default_timer()
+                    with nvtx_profiling("optimizer", args.device):
+                        for optimizer in optimizers:
+                            optimizer.step()
+                            optimizer.zero_grad()
+                        synchronize(args.device)
 
-            forward_timing.append(t1 - t0)
-            backward_timing.append(t3 - t2)
-            optimizers_timing.append(t4 - t3)
+                    t4 = timeit.default_timer()
+
+                forward_timing.append(t1 - t0)
+                if not args.forward_only:
+                    backward_timing.append(t3 - t2)
+                    optimizers_timing.append(t4 - t3)
+    except OutOfMemoryError as e:
+        oom_error = e
+
+    if args.memory_profile and args.device.startswith("cuda"):
+        os.makedirs("runs/memory", exist_ok=True)
+        precision = "bf16" if args.bf16 else "fp32"
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        oom = "_oom" if oom_error else ""
+        torch.cuda.memory._dump_snapshot(
+            f"runs/memory/d{args.model_d_model}_L{args.model_num_layers}_ctx{args.model_context_length}_{precision}_{timestamp}_forwardOnly{args.forward_only}{oom}.pickle")
+
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+    if oom_error:
+        raise oom_error
 
     print(f"Warmup iters: {args.w}")
     print(f"Measurement iters: {args.n}")
 
     print(f"Forward pass: {statistics.mean(forward_timing) * 1000:.2f} ± {statistics.stdev(forward_timing) * 1000:.2f} ms")
     print(f"Forward pass values: {forward_timing}")
+    if not args.forward_only:
+        print(f"Backward pass: {statistics.mean(backward_timing) * 1000:.2f} ± {statistics.stdev(backward_timing) * 1000:.2f} ms")
+        print(f"Backward pass values: {backward_timing}")
 
-    print(f"Backward pass: {statistics.mean(backward_timing) * 1000:.2f} ± {statistics.stdev(backward_timing) * 1000:.2f} ms")
-    print(f"Backward pass values: {backward_timing}")
-
-    print(f"Optimizer step: {statistics.mean(optimizers_timing) * 1000:.2f} ± {statistics.stdev(optimizers_timing) * 1000:.2f} ms")
-    print(f"Optimizer step values: {optimizers_timing}")
+        print(f"Optimizer step: {statistics.mean(optimizers_timing) * 1000:.2f} ± {statistics.stdev(optimizers_timing) * 1000:.2f} ms")
+        print(f"Optimizer step values: {optimizers_timing}")
 
 
 def nvtx_profiling(range_name: str, device: str):
@@ -211,6 +239,8 @@ if __name__ == "__main__":
     arg_parser.add_argument("--device", type=str, default="mps")
     arg_parser.add_argument("--batch_size", type=int, default=4)
     arg_parser.add_argument("--bf16", action="store_true")
+    arg_parser.add_argument("--memory_profile", action="store_true")
+    arg_parser.add_argument("--forward_only", action="store_true")
     args = arg_parser.parse_args()
 
     if args.optimizer_warmup_iters is None:
