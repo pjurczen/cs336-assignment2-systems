@@ -188,3 +188,23 @@ With BF16 the range issues (overflow/underflow) are solved, since its same range
 We can see a steady speedup in backward pass. Forward pass speedup is not so steady and is varying depending on the model size, that is likely caused by overhead added by the extra kernels from
 autocast
 while only giving speedups in minority of time that matmuls take in the forward pass itself.
+
+## 2.1.6 Problem (memory_profiling): Memory Profiling
+
+**(a)**
+
+For 128 context length the forward pass memory is not very interesting and mostly low and flat, only barely moving above weights memory.
+
+Training run memory of 128 context length looks as on the image:
+
+![training_run_memory](training_run_memory.png)
+
+We can see clear phases of forward pass, then backward pass, then optimizer step and then zero grad releasing memory, repeated twice since I ran 2 iterations.
+
+For 2048 context length we can see big memory peaks from the attention blocks since its memory depends on squared context length:
+
+![forward_pass_memory_2048](forward_pass_memory_2048.png)
+
+Training run with 2048 context crashes with OutOfMemoryError during forward pass, since activations with such big context length exceed our maximum memory.
+
+
