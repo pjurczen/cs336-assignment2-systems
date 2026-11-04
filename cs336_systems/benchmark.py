@@ -97,7 +97,8 @@ def benchmark(args: argparse.Namespace):
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
             logits = model(inputs)
 
-        loss: torch.Tensor = cross_entropy(logits, targets)
+            loss: torch.Tensor = cross_entropy(logits, targets)
+
         loss.backward()
 
         for optimizer in optimizers:
@@ -120,7 +121,8 @@ def benchmark(args: argparse.Namespace):
 
             t1 = timeit.default_timer()
             with nvtx_profiling("loss", args.device):
-                loss: torch.Tensor = cross_entropy(logits, targets)
+                with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                    loss: torch.Tensor = cross_entropy(logits, targets)
                 synchronize(args.device)
 
             t2 = timeit.default_timer()
