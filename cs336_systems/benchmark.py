@@ -39,7 +39,7 @@ def annotated_scaled_dot_product_attention(
 
 
 def benchmark(args: argparse.Namespace):
-    raw_model: torch.nn.Module = TransformerLM(
+    raw_model: TransformerLM = TransformerLM(
         vocab_size=args.model_vocab_size,
         context_length=args.model_context_length,
         num_layers=args.model_num_layers,
@@ -57,6 +57,7 @@ def benchmark(args: argparse.Namespace):
     if args.device.startswith("cuda"):
         # Let float32 matmuls run on TF32 tensor cores (A100 and newer).
         torch.set_float32_matmul_precision("high")
+        add_block_nvtx_ranges(raw_model)
 
     # aot_eager works on MPS; on CUDA the default inductor backend generates fused kernels.
     compile_backend: str = "inductor" if args.device.startswith("cuda") else "aot_eager"
@@ -182,6 +183,23 @@ def benchmark(args: argparse.Namespace):
 
         print(f"Optimizer step: {statistics.mean(optimizers_timing) * 1000:.2f} ± {statistics.stdev(optimizers_timing) * 1000:.2f} ms")
         print(f"Optimizer step values: {optimizers_timing}")
+
+
+def add_block_nvtx_ranges(model: TransformerLM):
+    def push(name: str):
+        def hook(*_):
+            nvtx.range_push(name)
+
+        return hook
+
+    def pop(*_):
+        nvtx.range_pop()
+
+    for i, block in enumerate(model.layers):
+        block.register_forward_pre_hook(push(f"block {i} forward"))
+        block.register_forward_hook(pop)
+        block.register_full_backward_pre_hook(push(f"block {i} backward"))
+        block.register_full_backward_hook(pop)
 
 
 def nvtx_profiling(range_name: str, device: str):
