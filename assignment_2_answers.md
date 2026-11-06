@@ -229,3 +229,9 @@ So for inference it increases memory usage, because autocast copies weights into
 On short context the memory peak with bf16 stays same as with fp32, because the activations in attention are small,
 with long context this changes dramatically and activations inside attention layers cause bigger peaks than the baseline
 from weights, gradients and momentums, meaning storing those attention activations in bf16 would reduce the effective peak memory.
+
+**(d)**
+
+Residual stream is a tensor of shape (batch_size, sequence_length, d_model), so it's size for XL model and default context length 512 would be:
+4 × 512 × 2560 × 4 bytes = 20'971'520 bytes = 20 MiB
+
