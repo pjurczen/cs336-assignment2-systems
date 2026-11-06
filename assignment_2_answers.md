@@ -232,6 +232,10 @@ from weights, gradients and momentums, meaning storing those attention activatio
 
 **(d)**
 
-Residual stream is a tensor of shape (batch_size, sequence_length, d_model), so it's size for XL model and default context length 512 would be:
-4 × 512 × 2560 × 4 bytes = 20'971'520 bytes = 20 MiB
+Residual stream is a tensor of shape (batch_size, sequence_length, d_model), so it's size for XL model and context length 2048 would be:
+4 × 2048 × 2560 × 4 bytes = 83'886'080 bytes = 80 MiB
 
+**(e)**
+
+That's 2GiB on 2048 context length, there are multiple allocations of this size inside the the scaled dot product attention block,
+for example the QK matmul, the softmax division, the max subtraction inside softmax and more.
