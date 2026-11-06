@@ -239,3 +239,69 @@ Residual stream is a tensor of shape (batch_size, sequence_length, d_model), so 
 
 That's 2GiB on 2048 context length, there are multiple allocations of this size inside the the scaled dot product attention block,
 for example the QK matmul, the softmax division, the max subtraction inside softmax and more.
+
+**(f)**
+
+Operations allocating memory:
+
+| t (ms) | MiB  | kind     | op              | module                                     |
+|--------|------|----------|-----------------|--------------------------------------------|
+| 0.28   | 5.0  | temp     | `aten::pow`     | `TransformerLM.layers.10.ln1`              |
+| 0.79   | 5.0  | RESIDUAL | `aten::mul`     | `TransformerLM.layers.10.ln1`              |
+| 1.02   | 5.0  | RESIDUAL | `aten::div`     | `TransformerLM.layers.10.ln1`              |
+| 1.74   | 15.0 | temp     | `aten::bmm`     | `TransformerLM.layers.10.attn.qkv_proj`    |
+| 2.45   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 2.65   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 2.83   | 2.5  | temp     | `aten::sub`     | `TransformerLM.layers.10.attn.rope`        |
+| 3.29   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 3.48   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 3.67   | 2.5  | temp     | `aten::add`     | `TransformerLM.layers.10.attn.rope`        |
+| 4.17   | 5.0  | RESIDUAL | `aten::cat`     | `TransformerLM.layers.10.attn.rope`        |
+| 5.0    | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 5.2    | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 5.4    | 2.5  | temp     | `aten::sub`     | `TransformerLM.layers.10.attn.rope`        |
+| 5.81   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 6.01   | 2.5  | temp     | `aten::mul`     | `TransformerLM.layers.10.attn.rope`        |
+| 6.2    | 2.5  | temp     | `aten::add`     | `TransformerLM.layers.10.attn.rope`        |
+| 6.64   | 5.0  | RESIDUAL | `aten::cat`     | `TransformerLM.layers.10.attn.rope`        |
+| 7.39   | 8.0  | temp     | `aten::bmm`     | `TransformerLM.layers.10.attn`             |
+| 7.7    | 8.0  | temp     | `aten::div`     | `TransformerLM.layers.10.attn`             |
+| 8.17   | 8.0  | temp     | `aten::empty`   | `TransformerLM.layers.10.attn`             |
+| 8.66   | 8.0  | temp     | `aten::sub`     | `TransformerLM.layers.10.attn`             |
+| 8.86   | 8.0  | RESIDUAL | `aten::exp`     | `TransformerLM.layers.10.attn`             |
+| 9.15   | 8.0  | RESIDUAL | `aten::div`     | `TransformerLM.layers.10.attn`             |
+| 9.77   | 5.0  | RESIDUAL | `aten::empty`   | `TransformerLM.layers.10.attn`             |
+| 10.01  | 5.0  | temp     | `aten::bmm`     | `TransformerLM.layers.10.attn`             |
+| 10.35  | 5.0  | RESIDUAL | `aten::empty`   | `TransformerLM.layers.10.attn`             |
+| 10.86  | 5.0  | temp     | `aten::bmm`     | `TransformerLM.layers.10.attn.output_proj` |
+| 11.61  | 5.0  | RESIDUAL | `aten::add`     | `TransformerLM.layers.10`                  |
+| 12.02  | 5.0  | temp     | `aten::pow`     | `TransformerLM.layers.10.ln2`              |
+| 12.52  | 5.0  | RESIDUAL | `aten::mul`     | `TransformerLM.layers.10.ln2`              |
+| 12.72  | 5.0  | RESIDUAL | `aten::div`     | `TransformerLM.layers.10.ln2`              |
+| 13.16  | 20.0 | RESIDUAL | `aten::bmm`     | `TransformerLM.layers.10.ffn.w1`           |
+| 13.47  | 20.0 | RESIDUAL | `aten::sigmoid` | `TransformerLM.layers.10.ffn`              |
+| 13.68  | 20.0 | RESIDUAL | `aten::mul`     | `TransformerLM.layers.10.ffn`              |
+| 14.05  | 20.0 | RESIDUAL | `aten::bmm`     | `TransformerLM.layers.10.ffn.w3`           |
+| 14.37  | 20.0 | RESIDUAL | `aten::mul`     | `TransformerLM.layers.10.ffn`              |
+| 14.73  | 5.0  | temp     | `aten::bmm`     | `TransformerLM.layers.10.ffn.w2`           |
+| 15.07  | 5.0  | RESIDUAL | `aten::add`     | `TransformerLM.layers.10`                  |
+
+Top 5 operations creating residual memory:
+
+| op              | tensors | MiB  | % of block residuals |
+|-----------------|---------|------|----------------------|
+| `aten::mul`     | 4       | 50.0 | 30.1                 |
+| `aten::bmm`     | 2       | 40.0 | 24.1                 |
+| `aten::sigmoid` | 1       | 20.0 | 12.0                 |
+| `aten::div`     | 3       | 18.0 | 10.8                 |
+| `aten::empty`   | 2       | 10.0 | 6.0                  |
+
+Data was exported by querying nsys sqlite files. UI does not support aggregating memory usage.
+
+Memory at start of forward pass (2nd iteration): 38.16 GiB
+Memory at end of forward pass: 43.34 GiB
+
+Memory at start of backward pass: 43.38 GiB
+Memory at end of backward pass: 50.82 GiB
+
+Memory difference in backward pass for one transformer layer (layer 11): 48.22 - 48.09 = +0.13 GiB
