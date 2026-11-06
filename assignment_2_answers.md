@@ -214,4 +214,18 @@ Training run with 2048 context crashes with OutOfMemoryError during forward pass
 | 128            | 12.8                           | 51.3                            |
 | 2048           | 21.6                           | 78.5                            |
 
-I ran my experiments on A100-80GiB, therefore it crashed around 80GiB.
+I ran my experiments on A100-80GiB, therefore it crashed around 80GiB
+
+**(c)**
+
+| xl, batch 4                      | fp32 peak                          | bf16 (autocast) peak               |
+|----------------------------------|------------------------------------|------------------------------------|
+| context 128, inference           | 12.79 GiB                          | 19.02 GiB                          |
+| context 128, full training step  | 51.29 GiB                          | 51.28 GiB                          |
+| context 2048, inference          | 21.58 GiB                          | 25.40 GiB                          |
+| context 2048, full training step | OOM in forward, at layer ~10 of 32 | OOM in forward, at layer ~14 of 32 |.
+
+So for inference it increases memory usage, because autocast copies weights into bf16 and keeps them until the block ends.
+On short context the memory peak with bf16 stays same as with fp32, because the activations in attention are small,
+with long context this changes dramatically and activations inside attention layers cause bigger peaks than the baseline
+from weights, gradients and momentums, meaning storing those attention activations in bf16 would reduce the effective peak memory.
