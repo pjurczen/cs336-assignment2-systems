@@ -305,3 +305,21 @@ Memory at start of backward pass: 43.38 GiB
 Memory at end of backward pass: 50.82 GiB
 
 Memory difference in backward pass for one transformer layer (layer 11): 48.22 - 48.09 = +0.13 GiB
+
+## 3.2.1 Problem (gradient_checkpointing): Memory-Optimal Gradient Checkpointing
+
+**(a)**
+
+The strategy is to recompute residuals of every layer when going down the backward graph by creating recursive checkpoints from layer N-1 to layer 1.
+We can save residuals of layer Nth, since we're gonna need it immediately when calling loss.backward() and it doesn't influence peak memory, since we're gonna
+be holding residuals of one layer when going down the graph anyway, just one at a time instead of all layers (as it would be without the checkpoints).
+This means that asymptotic memory with this solution is O(1) - we're holding residuals of one layer at a time only.
+This will cost us O(n²) compute though, since for all the layers from N-1 to 1 we will be essentially doing a forward pass to arrive at that layer's input to be
+able to recompute that layer's residuals.
+
+def checkpointed_blocks(layers: int, x: torch.Tensor) -> torch.Tensor:
+block = self.layers[layers - 1]
+if layers == 1:
+return block(x)
+h = checkpoint(checkpointed_blocks, layers - 1, x, use_reentrant=False)
+return block(h)
