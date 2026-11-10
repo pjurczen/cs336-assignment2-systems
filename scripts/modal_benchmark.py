@@ -31,7 +31,7 @@ app = modal.App("cs336-train", image=image)
 
 
 @app.function(gpu=GPU, timeout=TIMEOUT_MINUTES * 60, volumes={"/vol": volume}, secrets=[modal.Secret.from_name("wandb")])
-def benchmark(nsys_args: list[str], args: list[str], git_commit: str, env: str):
+def benchmark(nsys_args: list[str], args: list[str], git_commit: str, env: str, script: str):
     import os
     import shutil
     import subprocess
@@ -47,7 +47,7 @@ def benchmark(nsys_args: list[str], args: list[str], git_commit: str, env: str):
         prefix = ["nsys", "profile", *nsys_args] if nsys_args else []
         os.makedirs("runs/nsys", exist_ok=True)
         # --nvtx-capture only matches registered NVTX strings by default; torch.cuda.nvtx sends plain ones.
-        returncode = subprocess.run([*prefix, sys.executable, "cs336_systems/benchmark.py", *args],
+        returncode = subprocess.run([*prefix, sys.executable, script, *args],
                                     env=dict(os.environ, GIT_COMMIT=git_commit, NSYS_NVTX_PROFILER_REGISTER_ONLY="0", **dict(kv.split("=", 1) for kv in env.split()))).returncode
         for report in glob.glob("runs/nsys/*.nsys-rep"):
             stem = report.removesuffix(".nsys-rep")
@@ -58,7 +58,7 @@ def benchmark(nsys_args: list[str], args: list[str], git_commit: str, env: str):
             shutil.copytree("runs", "/vol/runs", dirs_exist_ok=True)
             volume.commit()
     if returncode != 0:
-        raise RuntimeError(f"benchmark.py exited with code {returncode}")
+        raise RuntimeError(f"{script} exited with code {returncode}")
 
 
 @app.function(timeout=10 * 60)
@@ -73,7 +73,7 @@ def check():
 
 
 @app.local_entrypoint()
-def main(args: str, gpu: str = GPU, nsys_args: str = "", env: str = ""):
+def main(args: str = "", gpu: str = GPU, nsys_args: str = "", env: str = "", script: str = "cs336_systems/benchmark.py"):
     """--gpu B200+ lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones."""
     import shlex
     import subprocess
@@ -82,4 +82,4 @@ def main(args: str, gpu: str = GPU, nsys_args: str = "", env: str = ""):
     git_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"]).returncode != 0:
         git_commit += "-dirty"
-    benchmark.with_options(gpu=gpu).remote(shlex.split(nsys_args), shlex.split(args), git_commit, env)
+    benchmark.with_options(gpu=gpu).remote(shlex.split(nsys_args), shlex.split(args), git_commit, env, script)
