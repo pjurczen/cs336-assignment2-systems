@@ -323,3 +323,41 @@ if layers == 1:
 return block(x)
 h = checkpoint(checkpointed_blocks, layers - 1, x, use_reentrant=False)
 return block(h)
+
+**(b)**
+
+peak memory ≈ (N/k) × input size + k × one block's residuals
+
+where k is selected block size for checkpointing, eg. we could create a checkpoint around 4 layers out of 32 for the XL model.
+
+We can measure one block's residual using PyTorch's MemoryViz:
+
+![Ctx 2048 residual memory](assets/ctx2048_residual_memory.png)
+
+which read from that tool is around 4.6 GiB when using bf16.
+
+The input size can be calculated as:
+batch size × sequence length × d_model × bytes per element = 4 × 2048 × 2560 × 4 bytes = 83'886'080 bytes
+= 80 MiB
+
+plugging this into our formula for peak memory:
+
+peak memory ≈ (32/k) × 0.078125 GiB + k × 4.6 GiB
+
+we can see that we will get minimal value when using low k value.
+
+For k=1 we get:
+
+peak memory ≈ 32 × 0.078125 GiB + 4.6 GiB = 2.5 GiB + 4.6 GiB = 7.1 GiB
+
+For k=2 we get:
+
+peak memory ≈ 32/2 × 0.078125 GiB + 2 × 4.6 GiB = 1.25 GiB + 9.2 GiB = 10.45 GiB
+
+Showing that k=1 minimizes the sum and gives minimal peak memory, meaning we would create one checkpoint around all 32 blocks.
+
+For k=1 the measured peak memory in memory viz during the backward pass is 63.3 GiB
+
+For k=2 the measured peak memory in memory viz during the backward pass is 67.5 GiB
+
+Confirming that k=1 is the best choice for lowest possible peak memory.
