@@ -18,6 +18,7 @@ from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.softmax import softmax
 from cs336_basics.transformer_lm import TransformerLM
+from cs336_systems.checkpointed_layers import CheckpointedLayers
 
 
 @nvtx.range("scaled dot product attention")
@@ -61,6 +62,19 @@ def benchmark(args: argparse.Namespace):
 
     # aot_eager works on MPS; on CUDA the default inductor backend generates fused kernels.
     compile_backend: str = "inductor" if args.device.startswith("cuda") else "aot_eager"
+
+    # Monkey-patch checkpointing
+    if args.model_checkpoints_layers > 0:
+        params_before = sum(p.numel() for p in raw_model.parameters())
+        assert args.model_checkpoints_layers <= len(raw_model.layers)
+        checkpoint_block_size = args.model_checkpoints_layers
+        checkpointed_layers = []
+        for i in range(0, len(raw_model.layers), checkpoint_block_size):
+            checkpointed_layers.append(CheckpointedLayers(raw_model.layers[i: i + checkpoint_block_size]))
+        raw_model.layers = torch.nn.ModuleList(checkpointed_layers)
+        params_after = sum(p.numel() for p in raw_model.parameters())
+        assert params_before == params_after
+
     # Forward passes go through the compiled wrapper; checkpoints use the plain model so keys have no "_orig_mod." prefix.
     model: torch.nn.Module = torch.compile(raw_model, backend=compile_backend) if args.model_compile else raw_model
 
@@ -165,7 +179,7 @@ def benchmark(args: argparse.Namespace):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         oom = "_oom" if oom_error else ""
         torch.cuda.memory._dump_snapshot(
-            f"runs/memory/d{args.model_d_model}_L{args.model_num_layers}_ctx{args.model_context_length}_{precision}_{timestamp}_forwardOnly{args.forward_only}{oom}.pickle")
+            f"runs/memory/d{args.model_d_model}_L{args.model_num_layers}_ctx{args.model_context_length}_{precision}_{timestamp}_forwardOnly{args.forward_only}_ckpt{args.model_checkpoints_layers}{oom}.pickle")
 
         torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -240,6 +254,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--model_context_length", type=int, default=512)
     arg_parser.add_argument("--model_vocab_size", type=int, default=10000)
     arg_parser.add_argument("--model_num_layers", type=int, default=12)
+    arg_parser.add_argument("--model_checkpoints_layers", type=int, default=0)
     arg_parser.add_argument("--model_d_model", type=int, default=768)
     arg_parser.add_argument("--model_d_ff", type=int, default=3072)
     arg_parser.add_argument("--model_num_heads", type=int, default=12)
