@@ -58,7 +58,10 @@ def benchmark(args: argparse.Namespace):
     if args.device.startswith("cuda"):
         # Let float32 matmuls run on TF32 tensor cores (A100 and newer).
         torch.set_float32_matmul_precision("high")
-        add_block_nvtx_ranges(raw_model)
+        # Profiling instrumentation lives inside the model, so torch.compile would split its graph at every NVTX call:
+        # only for nsys runs, never for timing comparisons.
+        if args.nvtx:
+            add_block_nvtx_ranges(raw_model)
 
     # aot_eager works on MPS; on CUDA the default inductor backend generates fused kernels.
     compile_backend: str = "inductor" if args.device.startswith("cuda") else "aot_eager"
@@ -79,7 +82,7 @@ def benchmark(args: argparse.Namespace):
     model: torch.nn.Module = torch.compile(raw_model, backend=compile_backend) if args.model_compile else raw_model
 
     # Monkey-patch for profiling
-    if args.device.startswith("cuda"):
+    if args.nvtx and args.device.startswith("cuda"):
         cs336_basics.attention.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
@@ -265,6 +268,8 @@ if __name__ == "__main__":
     arg_parser.add_argument("--model_qk_norm", action="store_true", help="RMSNorm on each head's queries and keys, before RoPE")
     arg_parser.add_argument("--model_logit_soft_cap", type=float, default=None, help="squash output logits to c * tanh(logits / c); unset turns it off")
     arg_parser.add_argument("--model_compile", action="store_true")
+    arg_parser.add_argument("--nvtx", action="store_true",
+                            help="NVTX ranges inside the model (block hooks, annotated attention) for nsys; leave off for timing")
     arg_parser.add_argument("--gradient_max_l2_norm", type=float, default=1.0)
     arg_parser.add_argument("--gradient_eps", type=float, default=1e-6)
     arg_parser.add_argument("--n", type=int, default=10)
