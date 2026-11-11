@@ -1,5 +1,6 @@
 import statistics
 import timeit
+from collections.abc import Callable
 
 import torch
 from torch import OutOfMemoryError
@@ -26,7 +27,19 @@ def memory_allocated(device: str) -> int:
         return torch.cuda.memory_allocated()
 
 
-def attention_benchmark(d_model: int, seq_len: int) -> dict:
+def empty_cache(device: str):
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+
+def result_keys(label: str) -> list[str]:
+    return [f"forward{label} (ms)", f"backward{label} (ms)", f"memory before backward{label} (MiB)", f"added by forward{label} (MiB)"]
+
+
+def attention_benchmark(attention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor], label: str, d_model: int,
+                        seq_len: int) -> dict:
     casual_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
     Q = torch.randn((batch_size, seq_len, d_model), device=device, requires_grad=True)
     K = torch.randn((batch_size, seq_len, d_model), device=device, requires_grad=True)
@@ -35,11 +48,11 @@ def attention_benchmark(d_model: int, seq_len: int) -> dict:
     backward_timing = []
     forward_timing = []
 
-    print(f"Benchmarking d_model: {d_model}, seq_len: {seq_len}")
+    print(f"Benchmarking{label} d_model: {d_model}, seq_len: {seq_len}")
 
-    # Warmup steps
+    # Warmup steps (for the compiled variant, the first forward and backward also compile)
     for _ in range(2):
-        logits: torch.Tensor = scaled_dot_product_attention(Q, K, V, casual_mask)
+        logits: torch.Tensor = attention(Q, K, V, casual_mask)
         logits.backward(grad_out)
     synchronize(device)
     before_forward_memory: int = 0
@@ -48,7 +61,7 @@ def attention_benchmark(d_model: int, seq_len: int) -> dict:
         before_forward_memory = memory_allocated(device)
 
         t0 = timeit.default_timer()
-        logits: torch.Tensor = scaled_dot_product_attention(Q, K, V, casual_mask)
+        logits: torch.Tensor = attention(Q, K, V, casual_mask)
         synchronize(device)
         t1 = timeit.default_timer()
 
@@ -60,11 +73,12 @@ def attention_benchmark(d_model: int, seq_len: int) -> dict:
         forward_timing.append(t1 - t0)
         backward_timing.append(t2 - t1)
 
+    forward_key, backward_key, memory_key, added_key = result_keys(label)
     return {
-        "forward (ms)": f"{statistics.mean(forward_timing) * 1000:.2f} ± {statistics.stdev(forward_timing) * 1000:.2f}",
-        "backward (ms)": f"{statistics.mean(backward_timing) * 1000:.2f} ± {statistics.stdev(backward_timing) * 1000:.2f}",
-        "memory before backward (MiB)": f"{after_forward_memory / 1024 ** 2:.2f}",
-        "added by forward (MiB)": f"{(after_forward_memory - before_forward_memory) / 1024 ** 2:.2f}",
+        forward_key: f"{statistics.mean(forward_timing) * 1000:.2f} ± {statistics.stdev(forward_timing) * 1000:.2f}",
+        backward_key: f"{statistics.mean(backward_timing) * 1000:.2f} ± {statistics.stdev(backward_timing) * 1000:.2f}",
+        memory_key: f"{after_forward_memory / 1024 ** 2:.2f}",
+        added_key: f"{(after_forward_memory - before_forward_memory) / 1024 ** 2:.2f}",
     }
 
 
@@ -80,12 +94,16 @@ rows = []
 for d_model in d_models:
     for seq_len in seq_lens:
         row = {"d_model": d_model, "seq_len": seq_len}
-        try:
-            row |= attention_benchmark(d_model, seq_len)
-        except OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print(f"OutOfMemoryError d_model: {d_model}, seq_len: {seq_len}")
-            row |= {"forward (ms)": "OOM", "backward (ms)": "OOM", "memory before backward (MiB)": "OOM", "added by forward (MiB)": "OOM"}
+        # Fresh Dynamo state per shape: compile statically for this configuration, and stay clear of the recompile limit.
+        torch._dynamo.reset()
+        variants = {"": scaled_dot_product_attention, " compiled": torch.compile(scaled_dot_product_attention)}
+        for label, attention in variants.items():
+            try:
+                row |= attention_benchmark(attention, label, d_model, seq_len)
+            except OutOfMemoryError:
+                print(f"OutOfMemoryError{label} d_model: {d_model}, seq_len: {seq_len}")
+                row |= {key: "OOM" for key in result_keys(label)}
+            empty_cache(device)
         rows.append(row)
 
 print(markdown_table(rows))
