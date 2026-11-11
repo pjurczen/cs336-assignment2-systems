@@ -361,3 +361,49 @@ For k=1 the measured peak memory in memory viz during the backward pass is 63.3 
 For k=2 the measured peak memory in memory viz during the backward pass is 67.5 GiB
 
 Confirming that k=1 is the best choice for lowest possible peak memory.
+
+## 4.1.1 Problem (pytorch_attention): PyTorch Attention Benchmarking
+
+| d_model | seq_len | forward (ms)  | backward (ms) | memory before backward (MiB) | added by forward (MiB) |
+|---------|---------|---------------|---------------|------------------------------|------------------------|
+| 16      | 256     | 0.47 ± 0.12   | 0.93 ± 0.15   | 21.40                        | 4.09                   |
+| 16      | 1024    | 0.70 ± 0.03   | 1.71 ± 0.14   | 86.34                        | 65.09                  |
+| 16      | 4096    | 7.73 ± 0.04   | 17.83 ± 0.15  | 1088.62                      | 1040.38                |
+| 16      | 8192    | 28.92 ± 0.10  | 65.03 ± 0.24  | 4273.00                      | 4160.75                |
+| 16      | 16384   | 115.22 ± 0.25 | 259.56 ± 0.27 | 16977.75                     | 16641.50               |
+| 16      | 32768   | OOM           | OOM           | OOM                          | OOM                    |
+| 32      | 256     | 0.43 ± 0.04   | 0.90 ± 0.17   | 22.40                        | 4.09                   |
+| 32      | 1024    | 0.70 ± 0.12   | 1.72 ± 0.16   | 90.34                        | 65.09                  |
+| 32      | 4096    | 7.94 ± 0.02   | 18.06 ± 0.20  | 1104.62                      | 1040.38                |
+| 32      | 8192    | 29.91 ± 0.04  | 66.20 ± 0.19  | 4305.00                      | 4160.75                |
+| 32      | 16384   | 119.62 ± 0.29 | 263.74 ± 0.29 | 17041.75                     | 16641.50               |
+| 32      | 32768   | OOM           | OOM           | OOM                          | OOM                    |
+| 64      | 256     | 0.43 ± 0.03   | 0.88 ± 0.12   | 24.40                        | 4.09                   |
+| 64      | 1024    | 0.72 ± 0.03   | 1.74 ± 0.13   | 98.34                        | 65.09                  |
+| 64      | 4096    | 8.40 ± 0.03   | 18.54 ± 0.16  | 1136.62                      | 1040.38                |
+| 64      | 8192    | 31.93 ± 0.07  | 68.58 ± 0.22  | 4369.00                      | 4160.75                |
+| 64      | 16384   | 127.42 ± 0.25 | 271.88 ± 0.36 | 17169.75                     | 16641.50               |
+| 64      | 32768   | OOM           | OOM           | OOM                          | OOM                    |
+| 128     | 256     | 0.46 ± 0.14   | 0.93 ± 0.21   | 28.40                        | 4.09                   |
+| 128     | 1024    | 0.78 ± 0.02   | 1.83 ± 0.16   | 114.34                       | 65.09                  |
+| 128     | 4096    | 9.37 ± 0.08   | 19.69 ± 0.17  | 1200.62                      | 1040.38                |
+| 128     | 8192    | 35.80 ± 0.13  | 72.89 ± 0.30  | 4497.00                      | 4160.75                |
+| 128     | 16384   | 142.97 ± 0.27 | 288.28 ± 0.37 | 17425.75                     | 16641.50               |
+| 128     | 32768   | OOM           | OOM           | OOM                          | OOM                    |
+
+I ran out of memory on A100-80GB with d_model=16 and seq_len=32768. For this configuration for a single head activations (stored in fp32) would require:
+
+- 𝑄𝐾⊤ matrix multiply: batch_size × num_heads × context_length²
+- softmax: batch_size × num_heads × context_length²
+  => 2 × batch_size × context_length² × 4 bytes = 2 × 8 × 32768² × 4 = 68'719'476'736 bytes = 64 GiB
+
+The memory saved for backward is quadratic in context_length, when seq_len doubles, memory from forward pass grows around 4x.
+
+To avoid saving this memory, we need to break down what forward pass saves exactly in shape of L × L for the backward pass:
+
+- the result of exp in softmax calculation
+- the inputs of attention output matmul (output of softmax @ Vᵀ)
+
+This points us to trick that flash attention uses: avoid saving the L × L matrices for the backward pass and recompute missing parts during the backward pass itself.
+We would also need to avoid materializing the L × L matrices during the forward pass as well.
+
