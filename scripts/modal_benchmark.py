@@ -8,7 +8,8 @@ so this file must not need torch or the project's modules locally.
 """
 import modal
 
-GPU = "B200"
+# "B200+" lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones.
+GPU = "A100-80GB"
 TIMEOUT_MINUTES = 60  # hard stop; training.py's --time_budget_minutes should end the run well before
 PROJECT_DIR = "/root/project"
 # Summary tables exported as CSV next to each nsys report (nsys stats doesn't run on macOS).
@@ -73,8 +74,7 @@ def check():
 
 
 @app.local_entrypoint()
-def main(args: str = "", gpu: str = GPU, nsys_args: str = "", env: str = "", script: str = "cs336_systems/benchmark.py"):
-    """--gpu B200+ lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones."""
+def main(args: str = "", nsys_args: str = "", env: str = "", script: str = "cs336_systems/benchmark.py"):
     import shlex
     import subprocess
 
@@ -82,4 +82,4 @@ def main(args: str = "", gpu: str = GPU, nsys_args: str = "", env: str = "", scr
     git_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--"]).returncode != 0:
         git_commit += "-dirty"
-    benchmark.with_options(gpu=gpu).remote(shlex.split(nsys_args), shlex.split(args), git_commit, env, script)
+    benchmark.remote(shlex.split(nsys_args), shlex.split(args), git_commit, env, script)
