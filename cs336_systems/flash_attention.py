@@ -53,7 +53,6 @@ class FlashAttention2Func(torch.autograd.Function):
         is_casual = ctx.is_casual
         dO = grad_out
 
-        flash_bwd_kernel = torch.compile(flash_bwd)
         return flash_bwd_kernel(Q, K, V, O, dO, L, is_casual)
 
 
@@ -72,3 +71,6 @@ def flash_bwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, O: torch.Tensor
     dQ = einsum(dS, K, "... q k, ... k d -> ... q d") / scale
     dK = einsum(dS, Q, "... q k, ... q d -> ... k d") / scale
     return dQ, dK, dV, None
+
+
+flash_bwd_kernel = torch.compile(flash_bwd)

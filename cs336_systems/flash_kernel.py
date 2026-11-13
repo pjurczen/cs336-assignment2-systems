@@ -2,6 +2,18 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(configs=[
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+],
+    key=['N_QUERIES', 'D']
+)
 @triton.jit
 def flash_fwd_kernel(
         Q_ptr, K_ptr, V_ptr,
@@ -72,22 +84,25 @@ def flash_fwd_kernel(
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)  # (6)
     m_i = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)  # (6)
 
-    Q_i = tl.load(Q_block_ptr)  # (Q_TILE_SIZE, D)
+    # A tile can reach past the end of the sequence (its size need not divide the length): those rows are read as zeros.
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
 
     q_pos = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
     k_arr = tl.arange(0, K_TILE_SIZE)
 
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        K_j = tl.load(K_block_ptr)  # (K_TILE_SIZE, D)
-        V_j = tl.load(V_block_ptr)  # (K_TILE_SIZE, D)
+        K_j = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, D)
+        V_j = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, D)
 
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE) (9)
 
+        # Keys past the end of the sequence are zero padding, not real keys, so they must get no weight either.
+        k_pos = j * K_TILE_SIZE + k_arr
+        mask = k_pos[None, :] >= N_KEYS
         if is_casual:
-            k_pos = j * K_TILE_SIZE + k_arr
-            mask = k_pos[None, :] > q_pos[:, None]
+            mask = mask | (k_pos[None, :] > q_pos[:, None])
 
-            S_ij = tl.where(mask, S_ij - 1e6, S_ij)
+        S_ij = tl.where(mask, S_ij - 1e6, S_ij)
 
         rowmax_S_ij = tl.max(S_ij, axis=1)  # (Q_TILE_SIZE, ) (10)
         m_ij = tl.maximum(m_i, rowmax_S_ij)  # (Q_TILE_SIZE, ) (10)
@@ -105,5 +120,6 @@ def flash_fwd_kernel(
     O_i = O_i / tl.expand_dims(l_i, 1)  # (15)
     L_i = m_i + tl.log(l_i)  # (16)
 
-    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty))
-    tl.store(L_block_ptr, L_i.to(L_block_ptr.type.element_ty))
+    # Rows past the end of the sequence are not written.
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0,))
+    tl.store(L_block_ptr, L_i.to(L_block_ptr.type.element_ty), boundary_check=(0,))
