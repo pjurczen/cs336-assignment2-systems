@@ -16,6 +16,7 @@ def flash_fwd_kernel(
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
+        is_casual: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -73,11 +74,21 @@ def flash_fwd_kernel(
 
     Q_i = tl.load(Q_block_ptr)  # (Q_TILE_SIZE, D)
 
+    q_pos = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    k_arr = tl.arange(0, K_TILE_SIZE)
+
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         K_j = tl.load(K_block_ptr)  # (K_TILE_SIZE, D)
         V_j = tl.load(V_block_ptr)  # (K_TILE_SIZE, D)
 
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE) (9)
+
+        if is_casual:
+            k_pos = j * K_TILE_SIZE + k_arr
+            mask = k_pos[None, :] > q_pos[:, None]
+
+            S_ij = tl.where(mask, S_ij - 1e6, S_ij)
+
         rowmax_S_ij = tl.max(S_ij, axis=1)  # (Q_TILE_SIZE, ) (10)
         m_ij = tl.maximum(m_i, rowmax_S_ij)  # (Q_TILE_SIZE, ) (10)
         P_ij = tl.exp(S_ij - tl.expand_dims(m_ij, 1))  # (Q_TILE_SIZE, K_TILE_SIZE) (11)

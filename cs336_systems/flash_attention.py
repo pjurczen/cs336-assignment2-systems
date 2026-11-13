@@ -56,7 +56,7 @@ class FlashAttention2Func(torch.autograd.Function):
 class FlashAttention2TritonFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx: FunctionCtx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+    def forward(ctx: FunctionCtx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_casual: bool = False) -> torch.Tensor:
         batch_size = Q.shape[0]
         Q_TILE_SIZE, K_TILE_SIZE = 16, 16
         N_QUERIES, N_KEYS = Q.shape[-2], K.shape[-2]
@@ -80,10 +80,12 @@ class FlashAttention2TritonFunc(torch.autograd.Function):
             scale,
             D=D,
             Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE
+            K_TILE_SIZE=K_TILE_SIZE,
+            is_casual=is_casual
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_casual = is_casual
 
         return O
 
