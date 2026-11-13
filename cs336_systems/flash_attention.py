@@ -5,8 +5,6 @@ import torch
 from einops import einsum
 from torch.autograd.function import FunctionCtx
 
-from cs336_systems.flash_kernel import flash_fwd_kernel
-
 
 class FlashAttention2Func(torch.autograd.Function):
 
@@ -46,49 +44,31 @@ class FlashAttention2Func(torch.autograd.Function):
             L[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE] = L_i  # (18)
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_casual = is_causal
         return O
 
     @staticmethod
     def backward(ctx: FunctionCtx, grad_out: Any):
-        raise NotImplementedError
+        L, Q, K, V, O = ctx.saved_tensors
+        is_casual = ctx.is_casual
+        dO = grad_out
+
+        flash_bwd_kernel = torch.compile(flash_bwd)
+        return flash_bwd_kernel(Q, K, V, O, dO, L, is_casual)
 
 
-class FlashAttention2TritonFunc(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx: FunctionCtx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_casual: bool = False) -> torch.Tensor:
-        batch_size = Q.shape[0]
-        Q_TILE_SIZE, K_TILE_SIZE = 16, 16
-        N_QUERIES, N_KEYS = Q.shape[-2], K.shape[-2]
-        D = Q.shape[-1]
-        scale = 1 / math.sqrt(D)
-
-        Tq = math.ceil(N_QUERIES / Q_TILE_SIZE)
-
-        O = torch.zeros_like(Q)
-        L = torch.zeros(Q.shape[:-1], device=Q.device, dtype=Q.dtype)
-
-        flash_fwd_kernel[(Tq, batch_size)](
-            Q, K, V,
-            O, L,
-            Q.stride(0), Q.stride(1), Q.stride(2),
-            K.stride(0), K.stride(1), K.stride(2),
-            V.stride(0), V.stride(1), V.stride(2),
-            O.stride(0), O.stride(1), O.stride(2),
-            L.stride(0), L.stride(1),
-            N_QUERIES, N_KEYS,
-            scale,
-            D=D,
-            Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=K_TILE_SIZE,
-            is_casual=is_casual
-        )
-
-        ctx.save_for_backward(L, Q, K, V, O)
-        ctx.is_casual = is_casual
-
-        return O
-
-    @staticmethod
-    def backward(ctx: FunctionCtx, grad_out: Any):
-        raise NotImplementedError
+def flash_bwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, O: torch.Tensor, dO: torch.Tensor, L: torch.Tensor, is_casual: bool):
+    seq_len = Q.shape[-2]
+    scale = math.sqrt(Q.shape[-1])
+    D = torch.sum(O * dO, dim=-1)
+    S = einsum(Q, K, "... q d, ... k d -> ... q k") / scale
+    if is_casual:
+        casual_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=Q.device))
+        S = S.masked_fill(~casual_mask, float("-Inf"))
+    P = torch.exp(S - L[..., None])
+    dV = einsum(P, dO, "... q k, ... q d -> ... k d")
+    dP = einsum(dO, V, "... q d, ... k d -> ... q k")
+    dS = P * (dP - D[..., None])
+    dQ = einsum(dS, K, "... q k, ... k d -> ... q d") / scale
+    dK = einsum(dS, Q, "... q k, ... q d -> ... k d") / scale
+    return dQ, dK, dV, None
