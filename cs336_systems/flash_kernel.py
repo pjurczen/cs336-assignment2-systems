@@ -1,19 +1,16 @@
 import triton
 import triton.language as tl
 
+TILE_SIZES = [16, 32, 64, 128]
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
-],
-    key=['N_QUERIES', 'D']
-)
+
+def tile_configs() -> list[triton.Config]:
+    """Every combination of query and key tile size, each with 4 and 8 warps (a new list for each kernel)."""
+    return [triton.Config(kwargs={'Q_TILE_SIZE': q_tile, 'K_TILE_SIZE': k_tile}, num_warps=num_warps)
+            for q_tile in TILE_SIZES for k_tile in TILE_SIZES for num_warps in (4, 8)]
+
+
+@triton.autotune(configs=tile_configs(), key=['N_QUERIES', 'D'])
 @triton.jit
 def flash_fwd_kernel(
         Q_ptr, K_ptr, V_ptr,
@@ -125,18 +122,7 @@ def flash_fwd_kernel(
     tl.store(L_block_ptr, L_i.to(L_block_ptr.type.element_ty), boundary_check=(0,))
 
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
-],
-    key=['N_KEYS', 'd']
-)
+@triton.autotune(configs=tile_configs(), key=['N_KEYS', 'd'])
 @triton.jit
 def flash_bwd_kv_kernel(
         Q_ptr, K_ptr, V_ptr,
@@ -272,18 +258,7 @@ def flash_bwd_kv_kernel(
     tl.store(dV_block_ptr, dV_ij.to(dV_block_ptr.type.element_ty), boundary_check=(0,))
 
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
-    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
-    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
-],
-    key=['N_KEYS', 'd']
-)
+@triton.autotune(configs=tile_configs(), key=['N_KEYS', 'd'])
 @triton.jit
 def flash_bwd_q_kernel(
         Q_ptr, K_ptr, V_ptr,
