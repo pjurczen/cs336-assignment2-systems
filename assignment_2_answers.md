@@ -535,3 +535,19 @@ xl, context 512, batch 4, fp32 (TF32 matmuls), A100 80GB PCIe, 5 warmup + 10 mea
 | bf16      | 128     | 16384   | 2.047              | 7.225              | 3.647               | 4.468                      | 13.700              | 5.687                       | 6.503                              | 20.918                      |
 | bf16      | 128     | 32768   | 6.096              | 28.421             | 14.318              | 14.792                     | 54.329              | 20.413                      | 20.865                             | 82.719                      |
 | bf16      | 128     | 65536   | 20.285             | 115.206            | 60.707              | 59.592                     | 218.939             | 81.018                      | 79.485                             | 334.271                     |
+
+## 5.1.1 Problem (distributed_communication_single_node): Distributed Communication (Single Node)
+
+| data size | 2 GPUs (ms)   | 4 GPUs (ms)   | 6 GPUs (ms)   |
+|-----------|---------------|---------------|---------------|
+| 1 MiB     | 0.37 ± 0.01   | 0.46 ± 0.03   | 0.54 ± 0.02   |
+| 10 MiB    | 2.74 ± 0.03   | 3.31 ± 0.02   | 3.49 ± 0.03   |
+| 100 MiB   | 26.55 ± 0.19  | 31.93 ± 0.11  | 33.74 ± 0.11  |
+| 1 GiB     | 271.50 ± 0.25 | 324.23 ± 1.71 | 343.23 ± 0.44 |
+
+![all_reduce_t4x6.png](assets/all_reduce_t4x6.png)
+
+We can observe increasing timings with increasing GPU counts, which makes sense because we don't really split any work between the GPUs and only measure the communication overhead,
+that should, as I observed it, increase with count of GPUs involved in the communication. The overhead per MiB decreases though with increasing data size and is lowest at 1GiB although
+looks asymptotic, meaning there is always gonna be some overhead with increasing count of GPUs regardless of the input size.
+
