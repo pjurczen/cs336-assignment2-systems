@@ -1,3 +1,4 @@
+import json
 import os
 import statistics
 import timeit
@@ -48,6 +49,14 @@ def distributed_benchmark(rank, world_size: int, input_size: int):
     timings = [t for ts in all_timings for t in ts]
     if rank == 0:
         print(f"World size: {world_size}, input size: {input_size * 4 / 1024 ** 2} MiB, timing: {statistics.mean(timings) * 1000:.2f} ± {statistics.stdev(timings) * 1000:.2f} ms")
+        # The same result as one JSON line, for scripts that read the log (scripts/plot_all_reduce.py).
+        print(json.dumps({
+            "world_size": world_size,
+            "size_mib": input_size * 4 / 1024 ** 2,
+            "mean_ms": statistics.mean(timings) * 1000,
+            "std_ms": statistics.stdev(timings) * 1000,
+            "device": torch.cuda.get_device_name(rank) if device == "cuda" else device,
+        }), flush=True)
 
     dist.destroy_process_group()
 
