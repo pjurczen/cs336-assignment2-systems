@@ -123,3 +123,283 @@ def flash_fwd_kernel(
     # Rows past the end of the sequence are not written.
     tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0,))
     tl.store(L_block_ptr, L_i.to(L_block_ptr.type.element_ty), boundary_check=(0,))
+
+
+@triton.autotune(configs=[
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+],
+    key=['N_KEYS', 'd']
+)
+@triton.jit
+def flash_bwd_kv_kernel(
+        Q_ptr, K_ptr, V_ptr,
+        dO_ptr, L_ptr, D_ptr,
+        dK_ptr, dV_ptr,
+        stride_qb, stride_qq, stride_qd,
+        stride_kb, stride_kk, stride_kd,
+        stride_vb, stride_vk, stride_vd,
+        stride_dob, stride_doq, stride_dod,
+        stride_lb, stride_lq,
+        stride_db, stride_dq,
+        stride_dkb, stride_dkk, stride_dkd,
+        stride_dvb, stride_dvk, stride_dvd,
+        N_QUERIES, N_KEYS,
+        scale,
+        d: tl.constexpr,
+        Q_TILE_SIZE: tl.constexpr,
+        K_TILE_SIZE: tl.constexpr,
+        is_casual: tl.constexpr,
+):
+    # Program indices
+    key_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, d),
+        strides=(stride_qq, stride_qd),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, d),
+        strides=(stride_kk, stride_kd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, d),
+        strides=(stride_vk, stride_vd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_dob,
+        shape=(N_QUERIES, d),
+        strides=(stride_doq, stride_dod),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_index * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr + batch_index * stride_dkb,
+        shape=(N_KEYS, d),
+        strides=(stride_dkk, stride_dkd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_index * stride_dvb,
+        shape=(N_KEYS, d),
+        strides=(stride_dvk, stride_dvd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    K_j = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, d) # (7)
+    V_j = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, d) # (7)
+
+    dK_ij = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)  # (8)
+    dV_ij = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)  # (8)
+
+    k_pos = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+    q_arr = tl.arange(0, Q_TILE_SIZE)
+
+    for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+        Q_i = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
+        dO_i = tl.load(dO_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
+        L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, )
+        D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, )
+
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE) (11)
+
+        q_pos = i * Q_TILE_SIZE + q_arr
+        mask = k_pos[None, :] >= N_KEYS
+        if is_casual:
+            mask = mask | (k_pos[None, :] > q_pos[:, None])
+
+        S_ij = tl.where(mask, S_ij - 1e6, S_ij)
+        P_ij = tl.exp(S_ij - tl.expand_dims(L_i, 1))  # (Q_TILE_SIZE, K_TILE_SIZE) (12)
+        dV_ij = dV_ij + tl.dot(tl.trans(P_ij.to(dO_i.dtype)), dO_i)  # (K_TILE_SIZE, d) (13)
+        dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE) (14)
+        dS_ij = P_ij * (dP_ij - tl.expand_dims(D_i, 1))  # (Q_TILE_SIZE, K_TILE_SIZE) (15)
+        dK_ij = dK_ij + tl.dot(tl.trans(dS_ij.to(Q_i.dtype)), Q_i) * scale  # (K_TILE_SIZE, d) (13)
+
+        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+
+    tl.store(dK_block_ptr, dK_ij.to(dK_block_ptr.type.element_ty), boundary_check=(0,))
+    tl.store(dV_block_ptr, dV_ij.to(dV_block_ptr.type.element_ty), boundary_check=(0,))
+
+
+@triton.autotune(configs=[
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=4),
+    triton.Config(kwargs={'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
+    triton.Config(kwargs={'Q_TILE_SIZE': 128, 'K_TILE_SIZE': 128}, num_warps=8),
+],
+    key=['N_KEYS', 'd']
+)
+@triton.jit
+def flash_bwd_q_kernel(
+        Q_ptr, K_ptr, V_ptr,
+        dO_ptr, L_ptr, D_ptr,
+        dQ_ptr,
+        stride_qb, stride_qq, stride_qd,
+        stride_kb, stride_kk, stride_kd,
+        stride_vb, stride_vk, stride_vd,
+        stride_dob, stride_doq, stride_dod,
+        stride_lb, stride_lq,
+        stride_db, stride_dq,
+        stride_dqb, stride_dqk, stride_dqd,
+        N_QUERIES, N_KEYS,
+        scale,
+        d: tl.constexpr,
+        Q_TILE_SIZE: tl.constexpr,
+        K_TILE_SIZE: tl.constexpr,
+        is_casual: tl.constexpr,
+):
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, d),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, d),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, d),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_dob,
+        shape=(N_QUERIES, d),
+        strides=(stride_doq, stride_dod),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_index * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    dQ_block_ptr = tl.make_block_ptr(
+        dQ_ptr + batch_index * stride_dqb,
+        shape=(N_QUERIES, d),
+        strides=(stride_dqk, stride_dqd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D) # (21)
+    dO_i = tl.load(dO_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
+
+    L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, )
+    D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, )
+
+    dQ_ij = tl.zeros((Q_TILE_SIZE, d), dtype=tl.float32)  # (22)
+
+    q_pos = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    k_arr = tl.arange(0, K_TILE_SIZE)
+
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        K_j = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, d) # (24)
+        V_j = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")  # (K_TILE_SIZE, d) # (24)
+
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE) (25)
+
+        k_pos = j * K_TILE_SIZE + k_arr
+        mask = k_pos[None, :] >= N_KEYS
+        if is_casual:
+            mask = mask | (k_pos[None, :] > q_pos[:, None])
+
+        S_ij = tl.where(mask, S_ij - 1e6, S_ij)
+        P_ij = tl.exp(S_ij - tl.expand_dims(L_i, 1))  # (Q_TILE_SIZE, K_TILE_SIZE) (26)
+        dP_ij = tl.dot(dO_i, tl.trans(V_j))  # (Q_TILE_SIZE, K_TILE_SIZE) (27)
+        dS_ij = P_ij * (dP_ij - tl.expand_dims(D_i, 1))  # (Q_TILE_SIZE, K_TILE_SIZE) (28)
+        dQ_ij = dQ_ij + tl.dot(dS_ij.to(K_j.dtype), K_j) * scale  # (Q_TILE_SIZE, d) (29)
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    tl.store(dQ_block_ptr, dQ_ij.to(dQ_block_ptr.type.element_ty), boundary_check=(0,))
