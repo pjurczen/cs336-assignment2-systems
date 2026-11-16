@@ -551,3 +551,20 @@ We can observe increasing timings with increasing GPU counts, which makes sense 
 that should, as I observed it, increase with count of GPUs involved in the communication. The overhead per MiB decreases though with increasing data size and is lowest at 1GiB although
 looks asymptotic, meaning there is always gonna be some overhead with increasing count of GPUs regardless of the input size.
 
+## 5.2 Problem (naive_ddp_benchmarking): Naïve DDP Benchmarking
+
+I ran 10 measurement iterations after 5 warmup iters on 2x A100-80GB using batch size (across both GPUs) of 8 and received following timings:
+
+Forward pass: 193.52 ± 1.08 ms
+
+Backward pass: 458.45 ± 2.70 ms
+
+Optimizer step: 268.69 ± 0.12 ms
+
+Communication: 86.48 ± 3.81 ms
+
+Total: 1011.55 ± 0.96 ms
+
+Communicating gradients makes 8.5% of a single full pass on average.
+
+
