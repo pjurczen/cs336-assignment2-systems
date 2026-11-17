@@ -578,3 +578,27 @@ What I observed on 2xA100-80GB, is that we are allocating new memory every itera
 memory and increasing latency massively. On 2xH200, where memory pool is much bigger, we see a small win of around 5% of the communication cost. Summarized: it might improve communication cost if
 we had a lot of small tensors, but in our case these are big matrices and we gain almost nothing, and we also induce increased memory usage cost.
 
+## 5.3.2 Problem (ddp_overlap_individual_parameters_benchmarking): DDP Overlapping Individual Parameters Benchmarking
+
+**(a)**
+
+| version                              | Forward pass (ms) | Backward pass (ms) | Optimizer step (ms) | Communication (ms) | Total per step (ms) |
+|--------------------------------------|-------------------|--------------------|---------------------|--------------------|---------------------|
+| per-parameter all-reduce             | 78.72 ± 0.36      | 218.33 ± 2.01      | 113.39 ± 0.06       | 51.28 ± 0.79       | 464.96 ± 2.24       |
+| single flat all-reduce               | 80.70 ± 2.06      | 218.88 ± 0.80      | 113.99 ± 0.23       | 48.65 ± 2.34       | 465.70 ± 3.70       |
+| overlapping per-parameter all-reduce | 80.52 ± 3.67      | 235.12 ± 4.87      | 115.23 ± 0.90       | 1.73 ± 0.73        | 435.73 ± 6.54       |
+
+So we see significant speedup when overlapping communication (around 30ms faster total step time), however we can observe slower backward pass. This is caused by our GPU sharing compute
+during the backward pass with the all-reduce operations and we also wait for the all-reduce kernels to finish before recording end of backward pass.
+
+**(b)**
+
+DDP naive:
+
+![ddp_naive.png](assets/ddp_naive.png)
+
+DDP with overlap:
+
+![ddp_overlap.png](assets/ddp_overlap.png)
+
+We can see on the DDP naive screenshot, that all-reduce kernels run within "gradient synchronization" block after backward pass, while on DDP overlap they run during the backward pass.
