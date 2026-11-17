@@ -5,6 +5,7 @@ import statistics
 import timeit
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -12,7 +13,15 @@ from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.transformer_lm import TransformerLM
-from distributed_data_parallel import DistributedDataParallelOverlapParams
+from distributed_data_parallel import DistributedDataParallel, DistributedDataParallelBatch, \
+    DistributedDataParallelOverlapParams
+
+# --ddp picks how the gradients are synchronized across ranks.
+DDP_IMPLEMENTATIONS: dict[str, type[torch.nn.Module]] = {
+    "naive": DistributedDataParallel,  # one all-reduce per parameter, after the backward pass
+    "batch": DistributedDataParallelBatch,  # one all-reduce over all gradients, flattened into a single tensor
+    "overlap": DistributedDataParallelOverlapParams,  # one asynchronous all-reduce per parameter, started during the backward pass
+}
 
 
 def _setup_process_group(rank: int, world_size: int, device: str):
@@ -64,7 +73,9 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
 
     # Forward passes go through the compiled wrapper; checkpoints use the plain model so keys have no "_orig_mod." prefix.
     model: torch.nn.Module = torch.compile(raw_model, backend=compile_backend) if args.model_compile else raw_model
-    ddp_model: DistributedDataParallelOverlapParams = DistributedDataParallelOverlapParams(model)
+    ddp_model: torch.nn.Module = DDP_IMPLEMENTATIONS[args.ddp](model)
+    # Phase ranges on the nsys timeline; off by default so timing runs are not affected.
+    use_nvtx: bool = args.nvtx and args.device.startswith("cuda")
 
     # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
     matrix_params = []
@@ -122,30 +133,35 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     for i in range(1, args.n + 1):
 
         t0 = timeit.default_timer()
-        with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
-            with torch.no_grad() if args.forward_only else contextlib.nullcontext():
-                logits = ddp_model(inputs)
-        synchronize(args.device)
+        with nvtx_range("forward", use_nvtx):
+            with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                with torch.no_grad() if args.forward_only else contextlib.nullcontext():
+                    logits = ddp_model(inputs)
+            synchronize(args.device)
 
         t1 = timeit.default_timer()
         if not args.forward_only:
-            with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
-                loss: torch.Tensor = cross_entropy(logits, targets)
-            synchronize(args.device)
+            with nvtx_range("loss", use_nvtx):
+                with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
+                    loss: torch.Tensor = cross_entropy(logits, targets)
+                synchronize(args.device)
 
             t2 = timeit.default_timer()
-            loss.backward()
-            synchronize(args.device)
+            with nvtx_range("backward", use_nvtx):
+                loss.backward()
+                synchronize(args.device)
 
             t3 = timeit.default_timer()
-            ddp_model.finish_gradient_synchronization()
-            synchronize(args.device)
+            with nvtx_range("gradient synchronization", use_nvtx):
+                ddp_model.finish_gradient_synchronization()
+                synchronize(args.device)
 
             t4 = timeit.default_timer()
-            for optimizer in optimizers:
-                optimizer.step()
-                optimizer.zero_grad()
-            synchronize(args.device)
+            with nvtx_range("optimizer", use_nvtx):
+                for optimizer in optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                synchronize(args.device)
 
             t5 = timeit.default_timer()
 
@@ -196,6 +212,11 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
+def nvtx_range(name: str, enabled: bool):
+    """A named range on the nsys timeline when enabled, otherwise nothing."""
+    return nvtx.range(name) if enabled else contextlib.nullcontext()
+
+
 def synchronize(device: str):
     if device == "mps":
         torch.mps.synchronize()
@@ -243,6 +264,10 @@ if __name__ == "__main__":
     arg_parser.add_argument("--batch_size", type=int, default=4, help="Batch size across all workers together")
     arg_parser.add_argument("--bf16", action="store_true")
     arg_parser.add_argument("--forward_only", action="store_true")
+    arg_parser.add_argument("--ddp", choices=list(DDP_IMPLEMENTATIONS), default="overlap",
+                            help="gradient synchronization: naive (per parameter, after backward), batch (one flat tensor), "
+                                 "overlap (per parameter, during backward)")
+    arg_parser.add_argument("--nvtx", action="store_true", help="NVTX ranges around the phases of each measured step, for nsys; leave off for timing")
     args = arg_parser.parse_args()
 
     assert args.n >= 2
