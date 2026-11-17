@@ -12,7 +12,7 @@ from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.transformer_lm import TransformerLM
-from distributed_data_parallel import DistributedDataParallel
+from distributed_data_parallel import DistributedDataParallelOverlapParams
 
 
 def _setup_process_group(rank: int, world_size: int, device: str):
@@ -64,7 +64,7 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
 
     # Forward passes go through the compiled wrapper; checkpoints use the plain model so keys have no "_orig_mod." prefix.
     model: torch.nn.Module = torch.compile(raw_model, backend=compile_backend) if args.model_compile else raw_model
-    ddp_model: DistributedDataParallel = DistributedDataParallel(model)
+    ddp_model: DistributedDataParallelOverlapParams = DistributedDataParallelOverlapParams(model)
 
     # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
     matrix_params = []
