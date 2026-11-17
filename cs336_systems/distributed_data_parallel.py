@@ -15,6 +15,9 @@ class DistributedDataParallel(torch.nn.Module):
         return self.module(x)
 
     def finish_gradient_synchronization(self):
-        for p in self.module.parameters():
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+        tensors = [p.grad for p in self.module.parameters() if p.grad is not None]
+        tensors_flat = torch._utils._flatten_dense_tensors(tensors)
+        dist.all_reduce(tensors_flat, op=dist.ReduceOp.AVG)
+        reduced = torch._utils._unflatten_dense_tensors(flat=tensors_flat, tensors=tensors)
+        for t, r in zip(tensors, reduced):
+            t.data = r.data

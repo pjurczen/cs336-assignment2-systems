@@ -567,4 +567,14 @@ Total: 1011.55 ± 0.96 ms
 
 Communicating gradients makes 8.5% of a single full pass on average.
 
+## 5.3.1 Problem (minimal_ddp_flat_benchmarking): Minimal DDP with Flat Gradients Benchmarking
+
+| version                  | Communication   | Total per step   |
+|--------------------------|-----------------|------------------|
+| per-parameter all-reduce | 51.28 ± 0.79 ms | 464.96 ± 2.24 ms |
+| single flat all-reduce   | 48.65 ± 2.34 ms | 465.70 ± 3.70 ms |
+
+What I observed on 2xA100-80GB, is that we are allocating new memory every iteration for flattened tensors, which exceeds the GPU memory every second iteration, causing pytorch to free allocated
+memory and increasing latency massively. On 2xH200, where memory pool is much bigger, we see a small win of around 5% of the communication cost. Summarized: it might improve communication cost if
+we had a lot of small tensors, but in our case these are big matrices and we gain almost nothing, and we also induce increased memory usage cost.
 
