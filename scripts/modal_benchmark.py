@@ -9,7 +9,7 @@ so this file must not need torch or the project's modules locally.
 import modal
 
 # "B200+" lets Modal pick a B200 or a B300 at the B200 price: shorter queues, but B300 timings aren't B200 ones.
-GPU = "A100-80GB"
+GPU = "H200:2"
 TIMEOUT_MINUTES = 60  # hard stop; training.py's --time_budget_minutes should end the run well before
 PROJECT_DIR = "/root/project"
 # Summary tables exported as CSV next to each nsys report (nsys stats doesn't run on macOS).

@@ -602,3 +602,50 @@ DDP with overlap:
 ![ddp_overlap.png](assets/ddp_overlap.png)
 
 We can see on the DDP naive screenshot, that all-reduce kernels run within "gradient synchronization" block after backward pass, while on DDP overlap they run during the backward pass.
+
+## 6 Problem (optimizer_state_sharding_accounting): Optimizer State Sharding Accounting
+
+**(a)**
+
+| GPU memory per rank (GB), second step onward | normal optimizer | sharded optimizer |
+|----------------------------------------------|------------------|-------------------|
+| after model init, peak                       | 13.63            | 13.63             |
+| before optimizer step, peak                  | 70.30            | 56.67             |
+| after optimizer step, peak                   | 55.19            | 41.56             |
+| after model init, held                       | 13.63            | 13.63             |
+| before optimizer step, held                  | 54.66            | 41.04             |
+| after optimizer step, held                   | 41.04            | 27.41             |
+
+| GPU memory per rank (GB), first step | normal optimizer | sharded optimizer |
+|--------------------------------------|------------------|-------------------|
+| before optimizer step, peak          | 43.05            | 43.05             |
+| after optimizer step, peak           | 54.98            | 41.35             |
+| before optimizer step, held          | 27.41            | 27.41             |
+| after optimizer step, held           | 41.04            | 27.41             |
+
+| memory breakdown per rank (GB)      | calculated from the held values as                    | normal optimizer | sharded optimizer |
+|-------------------------------------|-------------------------------------------------------|------------------|-------------------|
+| parameters                          | after model init                                      | 13.63            | 13.63             |
+| gradients                           | before optimizer step (first step) - after model init | 13.78            | 13.78             |
+| optimizer state                     | after optimizer step - after model init               | 27.41            | 13.78             |
+| forward and backward working memory | before optimizer step: peak - held                    | 15.64            | 15.63             |
+
+We can see how the memory is broken down between different components in both normal and sharded optimizers. We see, that we effectively held half of the optimizer state across both of our 2 ranks.
+The results do align with our expectations.
+
+**(b)**
+
+| time per iteration (ms) | normal optimizer | sharded optimizer |
+|-------------------------|------------------|-------------------|
+| Optimizer step          | 118.41 ± 2.97    | 99.42 ± 1.26      |
+| Total per step          | 456.56 ± 16.34   | 430.79 ± 12.91    |
+
+We can observe speedup in the optimizer step of around 19ms and in the total time of around 26ms. This can most likely be attributed to the fact that each sharded optimizer does update of only part of
+the parameters, but we add communication overhead and that's why the speedup isn't 2x but only around 1.19x.
+
+**(c)**
+
+What we did, is shard which model parameters get updated by each rank's optimizer, causing sharded 1st and 2nd moments and therefore inducing lower memory than unsharded runs, and then broadcast
+single parameters back to all ranks. We did not shard the gradients at all like ZeRO Stage 1 would. We also didn't do a single all-gather to communicate the updated parameters to all the ranks,
+but broadcasted them one-by-one parameter. Memory-wise we achieved same improvement as ZeRO Stage 1 would, as we only hold part of the optimizer state on each rank.
+Communication wise we communicated same amount of parameters, but did it one-by-one inducing bigger communication overhead.
