@@ -15,6 +15,7 @@ from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.transformer_lm import TransformerLM
 from distributed_data_parallel import DistributedDataParallel, DistributedDataParallelBatch, \
     DistributedDataParallelOverlapParams
+from sharded_optimizer import ShardedOptimizer
 
 # --ddp picks how the gradients are synchronized across ranks.
 DDP_IMPLEMENTATIONS: dict[str, type[torch.nn.Module]] = {
@@ -77,28 +78,7 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     # Phase ranges on the nsys timeline; off by default so timing runs are not affected.
     use_nvtx: bool = args.nvtx and args.device.startswith("cuda")
 
-    # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
-    matrix_params = []
-    other_params = []
-    for name, p in raw_model.named_parameters():
-        if args.optimizer_muon and p.ndim == 2 and name.startswith("layers"):
-            matrix_params.append(p)
-        else:
-            other_params.append(p)
-
-    adamw: torch.optim.Optimizer = AdamWOptimizer(
-        params=other_params,
-        lr=args.optimizer_lr_min,
-        weight_decay=args.optimizer_weight_decay,
-        betas=(args.optimizer_beta1, args.optimizer_beta2),
-        eps=args.optimizer_eps,
-    )
-    muon: torch.optim.Optimizer | None = MuonOptimizer(
-        params=matrix_params,
-        lr=args.optimizer_lr_min,
-        weight_decay=args.optimizer_weight_decay,
-    ) if args.optimizer_muon else None
-    optimizers: list[torch.optim.Optimizer] = [adamw] if muon is None else [adamw, muon]
+    optimizers: list[torch.optim.Optimizer] = get_optimizers(args, raw_model)
 
     inputs, targets = get_random_input_batch(batch_size=args.batch_size // world_size, context_length=args.model_context_length, vocab_size=args.model_vocab_size, device=args.device, dtype=torch.long)
 
@@ -107,6 +87,10 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     optimizers_timing = []
     communication_timing = []
     total_timing = []
+    # GPU memory readings of this rank (None when not on CUDA); the two lists get one entry per step, warmup steps first.
+    memory_after_model_init = memory_reading(device)
+    memory_before_optimizer_step = []
+    memory_after_optimizer_step = []
 
     for i in range(1, args.w + 1):
         with torch.autocast(device_type=args.device, dtype=torch.bfloat16, enabled=args.bf16):
@@ -120,9 +104,13 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
 
             ddp_model.finish_gradient_synchronization()
 
+            memory_before_optimizer_step.append(memory_reading(device))
+
             for optimizer in optimizers:
                 optimizer.step()
                 optimizer.zero_grad()
+
+            memory_after_optimizer_step.append(memory_reading(device))
 
         if i == args.w and rank == 0:
             print("Warmup done")
@@ -156,12 +144,16 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
                 ddp_model.finish_gradient_synchronization()
                 synchronize(args.device)
 
+            memory_before_optimizer_step.append(memory_reading(device))
+
             t4 = timeit.default_timer()
             with nvtx_range("optimizer", use_nvtx):
                 for optimizer in optimizers:
                     optimizer.step()
                     optimizer.zero_grad()
                 synchronize(args.device)
+
+            memory_after_optimizer_step.append(memory_reading(device))
 
             t5 = timeit.default_timer()
 
@@ -177,12 +169,19 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     all_optimizers_timing = [None] * world_size
     all_communication_timing = [None] * world_size
     all_total_timing = [None] * world_size
+    all_memory = [None] * world_size
 
     dist.all_gather_object(all_forward_timing, forward_timing)
     dist.all_gather_object(all_backward_timing, backward_timing)
     dist.all_gather_object(all_optimizers_timing, optimizers_timing)
     dist.all_gather_object(all_communication_timing, communication_timing)
     dist.all_gather_object(all_total_timing, total_timing)
+    # Each rank's GPU holds something different, so the memory readings stay separate per rank.
+    dist.all_gather_object(all_memory, {
+        "after model init": [memory_after_model_init],
+        "before optimizer step": memory_before_optimizer_step,
+        "after optimizer step": memory_after_optimizer_step,
+    })
 
     forward_timing = [t for ts in all_forward_timing for t in ts]
     backward_timing = [t for ts in all_backward_timing for t in ts]
@@ -209,7 +208,77 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
             print(f"Total: {statistics.mean(total_timing) * 1000:.2f} ± {statistics.stdev(total_timing) * 1000:.2f} ms")
             print(f"Total values: {total_timing}")
 
+        print_memory(all_memory)
+
     dist.destroy_process_group()
+
+
+def get_optimizers(args: argparse.Namespace, raw_model: torch.nn.Module):
+    # With --optimizer_muon, the 2D matrices inside the Transformer blocks go to Muon; everything else stays on AdamW.
+    matrix_params = []
+    other_params = []
+    for name, p in raw_model.named_parameters():
+        if args.optimizer_muon and p.ndim == 2 and name.startswith("layers"):
+            matrix_params.append(p)
+        else:
+            other_params.append(p)
+    optimizers: list[torch.optim.Optimizer] = []
+    if args.sharded_optimizer:
+        adamw_sharded: torch.optim.Optimizer = ShardedOptimizer(
+            params=other_params,
+            optimizer_cls=AdamWOptimizer,
+            lr=args.optimizer_lr_min,
+            weight_decay=args.optimizer_weight_decay,
+            betas=(args.optimizer_beta1, args.optimizer_beta2),
+            eps=args.optimizer_eps,
+        )
+        optimizers.append(adamw_sharded)
+        if args.optimizer_muon:
+            muon_sharded: torch.optim.Optimizer = ShardedOptimizer(
+                params=matrix_params,
+                optimizer_cls=MuonOptimizer,
+                lr=args.optimizer_lr_min,
+                weight_decay=args.optimizer_weight_decay,
+            )
+            optimizers.append(muon_sharded)
+    else:
+        adamw: torch.optim.Optimizer = AdamWOptimizer(
+            params=other_params,
+            lr=args.optimizer_lr_min,
+            weight_decay=args.optimizer_weight_decay,
+            betas=(args.optimizer_beta1, args.optimizer_beta2),
+            eps=args.optimizer_eps,
+        )
+        optimizers.append(adamw)
+        if args.optimizer_muon:
+            muon: torch.optim.Optimizer = MuonOptimizer(
+                params=matrix_params,
+                lr=args.optimizer_lr_min,
+                weight_decay=args.optimizer_weight_decay,
+            )
+            optimizers.append(muon)
+    return optimizers
+
+
+def memory_reading(device: str) -> dict[str, float] | None:
+    """GPU memory held by tensors, in GB (CUDA only): the peak since the previous reading, and the amount held right now."""
+    if not device.startswith("cuda"):
+        return None
+    reading = {"peak": round(torch.cuda.max_memory_allocated() / 1e9, 2), "now": round(torch.cuda.memory_allocated() / 1e9, 2)}
+    torch.cuda.reset_peak_memory_stats()  # the next reading's peak then covers only what happens from here on
+    return reading
+
+
+def print_memory(all_memory: list[dict[str, list[dict[str, float] | None]]]):
+    """Prints every rank's memory readings, one line per measuring point and kind of value."""
+    for rank, memory in enumerate(all_memory):
+        if memory["after model init"][0] is None:
+            continue  # this rank is not on CUDA
+        print(f"Memory on rank {rank} in GB (lists: one value per step, warmup steps first)")
+        for point, readings in memory.items():
+            for kind, description in (("peak", "peak since the previous reading"), ("now", "held at that moment")):
+                values = [reading[kind] for reading in readings]
+                print(f"  {point}, {description}: {values[0] if len(values) == 1 else values}")
 
 
 def nvtx_range(name: str, enabled: bool):
@@ -267,6 +336,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--ddp", choices=list(DDP_IMPLEMENTATIONS), default="overlap",
                             help="gradient synchronization: naive (per parameter, after backward), batch (one flat tensor), "
                                  "overlap (per parameter, during backward)")
+    arg_parser.add_argument("--sharded_optimizer", action="store_true")
     arg_parser.add_argument("--nvtx", action="store_true", help="NVTX ranges around the phases of each measured step, for nsys; leave off for timing")
     args = arg_parser.parse_args()
 
