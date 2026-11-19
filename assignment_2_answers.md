@@ -197,13 +197,13 @@ For 128 context length the forward pass memory is not very interesting and mostl
 
 Training run memory of 128 context length looks as on the image:
 
-![training_run_memory](training_run_memory.png)
+![training_run_memory](assets/training_run_memory.png)
 
 We can see clear phases of forward pass, then backward pass, then optimizer step and then zero grad releasing memory, repeated twice since I ran 2 iterations.
 
 For 2048 context length we can see big memory peaks from the attention blocks since its memory depends on squared context length:
 
-![forward_pass_memory_2048](forward_pass_memory_2048.png)
+![forward_pass_memory_2048](assets/forward_pass_memory_2048.png)
 
 Training run with 2048 context crashes with OutOfMemoryError during forward pass, since activations with such big context length exceed our maximum memory.
 
