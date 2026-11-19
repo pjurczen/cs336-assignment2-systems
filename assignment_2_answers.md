@@ -649,3 +649,19 @@ What we did, is shard which model parameters get updated by each rank's optimize
 single parameters back to all ranks. We did not shard the gradients at all like ZeRO Stage 1 would. We also didn't do a single all-gather to communicate the updated parameters to all the ranks,
 but broadcasted them one-by-one parameter. Memory-wise we achieved same improvement as ZeRO Stage 1 would, as we only hold part of the optimizer state on each rank.
 Communication wise we communicated same amount of parameters, but did it one-by-one inducing bigger communication overhead.
+
+## 7 Problem (fsdp_accounting): FSDP Accounting
+
+**(a)**
+
+Given that we held around 27.4 GiB for model parameters and gradients together and doing FSDP across 2 GPUs, we should reduce memory as following:
+
+- Parameters: we store only part of it, so 13.63/2 = 6.82 GB
+- Gradients: during the backward pass, we only store part of the gradients per GPU, so 13.78/2 = 6.89 GB, as we free them as soon as possible while stepping through the graph
+
+So our memory peaks should look like this:
+
+- after model initialization: 6.82 GB from sharded weights
+- before optimizer step: 42.97 GB from savings of around 13.7 GB in gradients and weights
+- after optimizer step: 27.86 GB from sharded gradients and model weights
+
