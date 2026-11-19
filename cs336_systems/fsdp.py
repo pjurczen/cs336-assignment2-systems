@@ -117,6 +117,14 @@ class FullyShardedDataParallel(torch.nn.Module):
                         out: torch.Tensor = torch.empty((shard_size, *param.grad.data.shape[1:]), dtype=param.grad.data.dtype, device=param.grad.data.device)
                         handle = dist.reduce_scatter_tensor(out, param.grad.data, op=dist.ReduceOp.AVG, async_op=True)
                         self.pending_gradients.append((param, out, handle))
+                        # Free memory from already scattered gradients
+                        not_ready_gradients = []
+                        for p, o, h in self.pending_gradients:
+                            if h.is_completed():
+                                p.grad.data = o.to(torch.float32)
+                            else:
+                                not_ready_gradients.append((p, o, h))
+                        self.pending_gradients = not_ready_gradients
 
                 return hook
 
