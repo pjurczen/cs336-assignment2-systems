@@ -15,6 +15,7 @@ from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.transformer_lm import TransformerLM
 from distributed_data_parallel import DistributedDataParallel, DistributedDataParallelBatch, \
     DistributedDataParallelOverlapParams
+from fsdp import FullyShardedDataParallel
 from sharded_optimizer import ShardedOptimizer
 
 # --ddp picks how the gradients are synchronized across ranks.
@@ -22,6 +23,7 @@ DDP_IMPLEMENTATIONS: dict[str, type[torch.nn.Module]] = {
     "naive": DistributedDataParallel,  # one all-reduce per parameter, after the backward pass
     "batch": DistributedDataParallelBatch,  # one all-reduce over all gradients, flattened into a single tensor
     "overlap": DistributedDataParallelOverlapParams,  # one asynchronous all-reduce per parameter, started during the backward pass
+    "fsdp": FullyShardedDataParallel,
 }
 
 
@@ -335,7 +337,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--forward_only", action="store_true")
     arg_parser.add_argument("--ddp", choices=list(DDP_IMPLEMENTATIONS), default="overlap",
                             help="gradient synchronization: naive (per parameter, after backward), batch (one flat tensor), "
-                                 "overlap (per parameter, during backward)")
+                                 "overlap (per parameter, during backward), fsdp (fully sharded)")
     arg_parser.add_argument("--sharded_optimizer", action="store_true")
     arg_parser.add_argument("--nvtx", action="store_true", help="NVTX ranges around the phases of each measured step, for nsys; leave off for timing")
     args = arg_parser.parse_args()
