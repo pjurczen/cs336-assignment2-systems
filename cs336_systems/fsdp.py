@@ -27,7 +27,8 @@ class FullyShardedDataParallel(torch.nn.Module):
         for i in range(2):
             if i in self.layers:
                 layer = self.layers[i]
-                handle, out_tensor, in_tensor = self._request_layer_gather(layer, self.compute_dtype)
+                out_tensor = self._create_layer_gather_out(layer, self.compute_dtype)
+                handle, in_tensor = self._request_layer_gather(layer, out_tensor, self.compute_dtype)
                 layer._fwd_gather_handle = handle
                 layer._fwd_gather_out = out_tensor
                 layer._fwd_gather_in = in_tensor
@@ -43,14 +44,18 @@ class FullyShardedDataParallel(torch.nn.Module):
             handle.wait()
         self.pending_unsharded_gradients.clear()
 
-    def _request_layer_gather(self, layer: torch.nn.Module, compute_dtype: torch.dtype | None = None):
-        in_tensor: torch.Tensor = layer.weight.data.to(compute_dtype)
-        shard_size: int = in_tensor.shape[0]
+    def _create_layer_gather_out(self, layer: torch.nn.Module, compute_dtype: torch.dtype | None = None):
+        dtype = compute_dtype or layer.weight.data.dtype
+        shard_size: int = layer.weight.data.shape[0]
         world_size: int = dist.get_world_size()
         full_size: int = shard_size * world_size
-        out_tensor: torch.Tensor = torch.empty((full_size, *in_tensor.shape[1:]), dtype=in_tensor.dtype, device=in_tensor.device)
+        out_tensor: torch.Tensor = torch.empty((full_size, *layer.weight.data.shape[1:]), dtype=dtype, device=layer.weight.data.device)
+        return out_tensor
+
+    def _request_layer_gather(self, layer: torch.nn.Module, out_tensor: torch.Tensor, compute_dtype: torch.dtype | None = None):
+        in_tensor: torch.Tensor = layer.weight.data.to(compute_dtype)
         handle = dist.all_gather_into_tensor(out_tensor, in_tensor, async_op=True)
-        return handle, out_tensor, in_tensor
+        return handle, in_tensor
 
     def _register_hooks(self, compute_dtype: torch.dtype | None = None):
         for mod in self.module.modules():
@@ -70,19 +75,25 @@ class FullyShardedDataParallel(torch.nn.Module):
                         m.weight.data = m._fwd_gather_out
                         del m._fwd_gather_out
                     else:
-                        handle, out_tensor, _ = self._request_layer_gather(m, dt)
+                        out_tensor = self._create_layer_gather_out(m, dt)
+                        handle, _ = self._request_layer_gather(m, out_tensor, dt)
                         handle.wait()
                         m.weight.data = out_tensor
 
                 return hook
 
-            def make_fwd_post(dt):
+            def make_fwd_post(dt, is_linear: bool):
                 def hook(m, inp, out):
+                    if is_linear:
+                        m._gathered = m.weight.data
+                        m._gathered_nbytes = m._gathered.untyped_storage().nbytes()
+                        m._gathered.untyped_storage().resize_(0)
                     m.weight.data = m._saved_fp32
                     del m._saved_fp32
                     if hasattr(m, "_layer_pos") and m._layer_pos + 2 in self.layers:
                         future_layer = self.layers[m._layer_pos + 2]
-                        handle, out_tensor, in_tensor = self._request_layer_gather(future_layer, dt)
+                        out_tensor = self._create_layer_gather_out(future_layer, dt)
+                        handle, in_tensor = self._request_layer_gather(future_layer, out_tensor, dt)
                         future_layer._fwd_gather_handle = handle
                         future_layer._fwd_gather_out = out_tensor
                         future_layer._fwd_gather_in = in_tensor
@@ -90,13 +101,15 @@ class FullyShardedDataParallel(torch.nn.Module):
                 return hook
 
             mod.register_forward_pre_hook(make_fwd_pre(compute_dtype))
-            mod.register_forward_hook(make_fwd_post(compute_dtype))
+            mod.register_forward_hook(make_fwd_post(compute_dtype, isinstance(mod, Linear)))
 
             if isinstance(mod, Linear):
                 def make_bwd_pre(dt):
                     def hook(m, grad_out):
                         m._saved_fp32_bwd = m.weight.data
-                        handle, out_tensor, _ = self._request_layer_gather(m, dt)
+                        m._gathered.untyped_storage().resize_(m._gathered_nbytes)
+                        out_tensor = m._gathered
+                        handle, _ = self._request_layer_gather(m, out_tensor, dt)
                         handle.wait()
                         m.weight.data = out_tensor
 
@@ -106,9 +119,14 @@ class FullyShardedDataParallel(torch.nn.Module):
 
             def make_grad_hook(m, is_linear):
                 def hook(param: torch.Tensor) -> None:
-                    if is_linear and hasattr(m, "_saved_fp32_bwd"):
-                        m.weight.data = m._saved_fp32_bwd
-                        del m._saved_fp32_bwd
+                    if is_linear:
+                        if hasattr(m, "_saved_fp32_bwd"):
+                            m.weight.data = m._saved_fp32_bwd
+                            del m._saved_fp32_bwd
+                        if hasattr(m, "_gathered"):
+                            del m._gathered
+                        if hasattr(m, "_gathered_nbytes"):
+                            del m._gathered_nbytes
                     if param.grad is not None:
                         world_size: int = dist.get_world_size()
                         dim: int = param.grad.data.shape[0]
