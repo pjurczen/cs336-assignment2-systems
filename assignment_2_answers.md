@@ -665,3 +665,30 @@ So our memory peaks should look like this:
 - before optimizer step: 42.97 GB from savings of around 13.7 GB in gradients and weights
 - after optimizer step: 27.86 GB from sharded gradients and model weights
 
+**(b)**
+
+| time per iteration (ms) | DDP, normal optimizer | DDP, sharded optimizer | FSDP          |
+|-------------------------|-----------------------|------------------------|---------------|
+| Forward pass            | 85.46 ± 7.14          | 82.35 ± 1.36           | 98.68 ± 2.33  |
+| Backward pass           | 244.36 ± 11.84        | 241.24 ± 11.64         | 266.47 ± 1.00 |
+| Optimizer step          | 118.41 ± 2.97         | 99.42 ± 1.26           | 62.88 ± 0.90  |
+| Total per step          | 456.56 ± 16.34        | 430.79 ± 12.91         | 436.14 ± 2.36 |
+
+| GPU memory per rank (GB), second step onward | DDP, normal optimizer | DDP, sharded optimizer | FSDP          |
+|----------------------------------------------|-----------------------|------------------------|---------------|
+| after model init, held                       | 13.63                 | 13.63                  | 6.82          |
+| before optimizer step, peak                  | 70.30                 | 56.67                  | 50.08         |
+| before optimizer step, held                  | 54.66                 | 41.04                  | 27.51 - 32.31 |
+| after optimizer step, peak                   | 55.19                 | 41.56                  | 27.78 - 32.57 |
+| after optimizer step, held                   | 41.04                 | 27.41                  | 20.75 - 27.95 |
+
+We can see that our memory compared to DDP with sharded optimizer only went down by 6.59 GB, which means the big peak before the optimizer step is caused by the activations and not by the gradients.
+We can see that communication does finish in time for the forward pass
+
+![profiling_fsdp.png](assets/profiling_fsdp.png)
+
+Marked by the red line we can see when the gather kernel is launched for layer 31 ffn.w1, where it's executed and where its compute is launched. Well ahead of time.
+
+Same for first and second layer, there is really no waiting time:
+
+![profiling_fsdp_first_layers.png](assets/profiling_fsdp_first_layers.png)

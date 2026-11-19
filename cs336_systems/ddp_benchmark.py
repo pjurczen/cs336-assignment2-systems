@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from cs336_basics.adamw_optimizer import AdamWOptimizer
 from cs336_basics.cross_entropy import cross_entropy
+from cs336_basics.model import Embedding, Linear
 from cs336_basics.muon_optimizer import MuonOptimizer
 from cs336_basics.transformer_lm import TransformerLM
 from distributed_data_parallel import DistributedDataParallel, DistributedDataParallelBatch, \
@@ -79,6 +80,8 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     ddp_model: torch.nn.Module = DDP_IMPLEMENTATIONS[args.ddp](model)
     # Phase ranges on the nsys timeline; off by default so timing runs are not affected.
     use_nvtx: bool = args.nvtx and args.device.startswith("cuda")
+    if use_nvtx:
+        add_layer_nvtx_ranges(ddp_model, raw_model)
 
     optimizers: list[torch.optim.Optimizer] = get_optimizers(args, raw_model)
 
@@ -90,7 +93,10 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     communication_timing = []
     total_timing = []
     # GPU memory readings of this rank (None when not on CUDA); the two lists get one entry per step, warmup steps first.
+    # A reading resets the peak, so each "peak" covers only the phase since the reading before it.
     memory_after_model_init = memory_reading(device)
+    memory_after_forward = []
+    memory_after_backward = []
     memory_before_optimizer_step = []
     memory_after_optimizer_step = []
 
@@ -102,7 +108,9 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
                 loss: torch.Tensor = cross_entropy(logits, targets)
 
         if not args.forward_only:
+            memory_after_forward.append(memory_reading(device))
             loss.backward()
+            memory_after_backward.append(memory_reading(device))
 
             ddp_model.finish_gradient_synchronization()
 
@@ -136,12 +144,15 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
                     loss: torch.Tensor = cross_entropy(logits, targets)
                 synchronize(args.device)
 
+            memory_after_forward.append(memory_reading(device))
+
             t2 = timeit.default_timer()
             with nvtx_range("backward", use_nvtx):
                 loss.backward()
                 synchronize(args.device)
 
             t3 = timeit.default_timer()
+            memory_after_backward.append(memory_reading(device))
             with nvtx_range("gradient synchronization", use_nvtx):
                 ddp_model.finish_gradient_synchronization()
                 synchronize(args.device)
@@ -181,6 +192,8 @@ def benchmark(rank: int, world_size: int, args: argparse.Namespace):
     # Each rank's GPU holds something different, so the memory readings stay separate per rank.
     dist.all_gather_object(all_memory, {
         "after model init": [memory_after_model_init],
+        "after forward": memory_after_forward,
+        "after backward": memory_after_backward,
         "before optimizer step": memory_before_optimizer_step,
         "after optimizer step": memory_after_optimizer_step,
     })
@@ -281,6 +294,34 @@ def print_memory(all_memory: list[dict[str, list[dict[str, float] | None]]]):
             for kind, description in (("peak", "peak since the previous reading"), ("now", "held at that moment")):
                 values = [reading[kind] for reading in readings]
                 print(f"  {point}, {description}: {values[0] if len(values) == 1 else values}")
+
+
+def add_layer_nvtx_ranges(ddp_model: torch.nn.Module, raw_model: torch.nn.Module):
+    """Labels the nsys timeline per layer: "compute <layer>" around each Linear/Embedding forward and, under FSDP,
+    "gather <layer>" around each request for that layer's full weight. Call it after the model has been wrapped."""
+    names: dict[torch.nn.Module, str] = {}
+
+    def push_compute_range(module, inputs):
+        nvtx.range_push(f"compute {names[module]}")  # returns nothing, so the layer's input stays as it is
+
+    def pop_compute_range(module, inputs, output):
+        nvtx.range_pop()
+
+    for name, module in raw_model.named_modules():
+        if isinstance(module, (Linear, Embedding)):
+            names[module] = name
+            # The wrapper's own hooks are already registered, so its pre-hook (waiting for the weight) runs before the
+            # push. prepend=True makes the pop run before its post-hook, which may start the gather for a later layer.
+            module.register_forward_pre_hook(push_compute_range)
+            module.register_forward_hook(pop_compute_range, prepend=True)
+
+    request_gather = getattr(ddp_model, "_request_layer_gather", None)
+    if request_gather is not None:
+        def named_request_gather(layer, *args, **kwargs):
+            with nvtx.range(f"gather {names.get(layer, '?')}"):
+                return request_gather(layer, *args, **kwargs)
+
+        ddp_model._request_layer_gather = named_request_gather
 
 
 def nvtx_range(name: str, enabled: bool):
