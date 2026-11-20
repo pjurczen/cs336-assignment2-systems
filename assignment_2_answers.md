@@ -731,3 +731,42 @@ Each all-reduce costs 2 (𝑁 − 1)/𝑁 × 𝑆/𝑊 seconds, our S for each o
 
 So the limit depends on the batch size 𝐵, egress bandwidth 𝑊 and accelerator speed 𝐶, and is not dependant on the model size.
 
+## 8.3 Problem (fsdp_calcs): Fully sharded data parallel calculations
+
+**(a)**
+
+Both forward and backward passes are exactly same computation on exactly same batch-sharded input, therefore:
+
+- the backward pass is 12 × 𝐵/𝑁FSDP × 𝐷 × 𝐷FF per device
+- the forward pass is:
+  𝒙𝟏: (B/𝑁FSDP, D) × (D, 𝐷FF) => 2 × B/𝑁FSDP × D × 𝐷FF
+  𝒙𝟐: (B/𝑁FSDP, D) × (D, 𝐷FF) => 2 × B/𝑁FSDP × D × 𝐷FF
+  𝒚: (B/𝑁FSDP, 𝐷FF) × (𝐷FF, D) => 2 × B/𝑁FSDP × 𝐷FF × D
+  Total: 6 × B/𝑁FSDP × D × 𝐷FF
+
+**(b)**
+
+Backward pass for FSDP is a all-gather, which is (𝑁 − 1)/𝑁 × 𝑆/𝑊 seconds + reduce-scatter which is also (𝑁 − 1)/𝑁 × 𝑆/𝑊, now substituting our FFN and FSDP in:
+in all-gather our weights are 3 × 𝐷𝐷FF / 𝑁FSDP spread over 𝑁FSDP devices and our weights are in FP16 (2 bytes), therefore:
+(𝑁FSDP − 1)/𝑁FSDP × (3 × 𝑁FSDP × (2 × 𝐷𝐷FF / 𝑁FSDP))/𝑊 = 6 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷𝐷FF/𝑊 seconds
+in reduce-scatter we reduce chunks in size 𝐷𝐷FF / 𝑁FSDP over 𝑁FSDP devices, communication is exactly the same as of the all-gather:
+6 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷𝐷FF/𝑊 seconds
+
+Backward pass total: 12 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷𝐷FF/𝑊 seconds
+
+Forward pass is only all-gather, so communication cost is: 6 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷𝐷FF/𝑊 seconds
+
+**(c)**
+
+Backward pass:
+12 × 𝐵/𝑁FSDP × 𝐷 × 𝐷FF / 𝐶 ≥ 12 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷 × 𝐷FF/𝑊 // multiply by 𝑁FSDP, divide by 12 𝐷 𝐷FF
+𝐵 / 𝐶 ≥ (𝑁FSDP − 1)/𝑊 // multiply by 𝑊
+𝐵 × 𝑊 / 𝐶 ≥ 𝑁FSDP − 1
+𝑁FSDP ≤ 𝐵 × 𝑊 / 𝐶 + 1
+
+Forward pass:
+6 × B/𝑁FSDP × D × 𝐷FF / 𝐶 ≥ 6 × (𝑁FSDP − 1)/𝑁FSDP × 𝐷𝐷FF/𝑊
+rearranging same as backward pass we arrive at:
+𝑁FSDP ≤ 𝐵 × 𝑊 / 𝐶 + 1
+
+We arrived at same bound as with data parallel, which is expected, because compute is same and all-reduce equals all-gather + reduce-scatter in terms of communication.
