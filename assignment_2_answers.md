@@ -770,3 +770,52 @@ rearranging same as backward pass we arrive at:
 𝑁FSDP ≤ 𝐵 × 𝑊 / 𝐶 + 1
 
 We arrived at same bound as with data parallel, which is expected, because compute is same and all-reduce equals all-gather + reduce-scatter in terms of communication.
+
+## 8.4 Problem (tp_calcs): Tensor parallel calculations
+
+**(a)**
+
+- 𝒅𝒛(𝒊) = 𝒅𝒚 𝑾𝟑(𝒊)⊤ => (B, 𝐷) × (𝐷FF/𝑁TP, 𝐷)⊤
+- 𝒅𝒙𝟐(𝒊) = 𝒅𝒛(𝒊) ∗ 𝑓(𝒙𝟏(𝒊))
+- 𝒅𝒙𝟏(𝒊) = 𝒅𝒛(𝒊) ∗ 𝑓′(𝒙𝟏(𝒊)) ∗ 𝒙𝟐(𝒊)
+- 𝒅𝒙 = all-reduce(𝒅𝒙𝟏(𝒊) 𝑾𝟏(𝒊)⊤ + 𝒅𝒙𝟐(𝒊) 𝑾𝟐(𝒊)⊤, op=SUM) => (B, DFF/𝑁TP) × (D, DFF/𝑁TP)⊤ + (B, DFF/𝑁TP) × (D, DFF/𝑁TP)⊤ => (B, D)
+- 𝒅𝑾𝟑(𝒊) = 𝒛(𝒊)⊤ 𝒅𝒚 => (B, 𝐷FF/𝑁TP)⊤ × (B, D)
+- 𝒅𝑾𝟐(𝒊) = 𝒙⊤ 𝒅𝒙𝟐(𝒊) => (B, 𝐷)⊤ × (B, DFF/𝑁TP) => (D, DFF/𝑁TP)
+- 𝒅𝑾𝟏(𝒊) = 𝒙⊤ 𝒅𝒙𝟏(𝒊) => (B, 𝐷)⊤ × (B, DFF/𝑁TP) => (D, DFF/𝑁TP)
+
+**(b)**
+
+Forward pass:
+
+- 𝒙𝟏(𝒊) = 𝒙 𝑾𝟏(𝒊): (B, D) × (D, DFF/𝑁TP) => 2 × B × D × DFF/𝑁TP
+- 𝒙𝟐(𝒊) = 𝒙 𝑾𝟐(𝒊): (B, D) × (D, DFF/𝑁TP) => 2 × B × D × DFF/𝑁TP
+- 𝒛(𝒊) = 𝑓(𝒙𝟏(𝒊)) ∗ 𝒙𝟐(𝒊)
+- 𝒚(𝒊) = 𝒛(𝒊) 𝑾𝟑(𝒊): (B, DFF/𝑁TP) × (DFF/𝑁TP, D) => 2 × B × DFF/𝑁TP × D
+- 𝒚 = all-reduce({𝒚(𝒊)}), over 𝑖 = 0, …, 𝑁TP − 1
+
+Total forward pass: 6 × B × D × DFF/𝑁TP
+
+Backward pass is 2× forward pass so: 12 × B × D × DFF/𝑁TP
+
+**(c)**
+
+Forward pass:
+We have 1 all-reduce, so that requires 2 (𝑁 − 1)/𝑁 × 𝑆/𝑊 which for 𝑁TP TP and FP16 gives:
+𝑆 = B × D × 2 bytes
+so:
+4 × (𝑁TP − 1)/𝑁TP × B × D/𝑊 seconds
+
+Backward pass:
+We also have 1 all-reduce over (B, D) tensor created from shards, so communication is also:
+4 × (𝑁TP − 1)/𝑁TP × B × D/𝑊 seconds
+
+**(d)**
+
+Backward pass:
+12 × B × D × DFF/𝑁TP / 𝐶 ≥ 4 × (𝑁TP − 1)/𝑁TP × B × D/𝑊 // divide by 4, B, D, multiply by W, 𝑁TP
+3 × DFF × 𝑊 / 𝐶 ≥ 𝑁TP − 1
+𝑁TP ≤ 3 × 𝐷FF × 𝑊 / 𝐶 + 1
+
+Forward pass:
+𝑁TP ≤ 1.5 × 𝐷FF × 𝑊 / 𝐶 + 1
+(half compute of backward pass)
