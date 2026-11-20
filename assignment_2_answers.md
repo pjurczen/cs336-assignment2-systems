@@ -692,3 +692,8 @@ Marked by the red line we can see when the gather kernel is launched for layer 3
 Same for first and second layer, there is really no waiting time:
 
 ![profiling_fsdp_first_layers.png](assets/profiling_fsdp_first_layers.png)
+
+## 8.1 Problem (alternate_ring_all_reduce): Alternate ring all-reduce
+
+The time for this algorithm is (N-1) × S/W because at every step we send the full tensor of size S and we run it for N-1 steps until all nodes receive tensors from other nodes with bandwidth W.
+
