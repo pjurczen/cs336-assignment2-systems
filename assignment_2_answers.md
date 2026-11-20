@@ -717,4 +717,17 @@ Because each matmul is gonna be ran for 𝐵/𝑁DP shard only, 6 matmuls each c
 **(b)**
 
 Each all-reduce costs 2 (𝑁 − 1)/𝑁 × 𝑆/𝑊 seconds, our S for each of 𝒅𝑾1, 𝒅𝑾𝟐 and 𝒅𝑾3 is 𝐷FF × 𝐷 × 2 bytes, so for 𝑁DP devices it will cost us:
-6 × (𝑁DP − 1)/𝑁DP × 𝐷FF × 𝐷 × 2 / 𝑊 seconds to do the necessary all-reduces.
+12 × (𝑁DP − 1)/𝑁DP × 𝐷FF × 𝐷 / 𝑊 seconds to do the necessary all-reduces.
+
+**(c)**
+
+12 × 𝐵/𝑁DP × 𝐷 × 𝐷FF / 𝐶 ≥ 12 × (𝑁DP − 1)/𝑁DP × 𝐷FF × 𝐷 / 𝑊 // multiply by 𝑁DP, divide by 12, divide by 𝐷, divide by 𝐷FF
+
+𝐵 / 𝐶 ≥ (𝑁DP − 1) / 𝑊 // multiply by 𝑊
+
+𝐵 × 𝑊 / 𝐶 ≥ 𝑁DP − 1. // rearranging
+
+𝑁DP ≤ 𝐵 × 𝑊 / 𝐶 + 1
+
+So the limit depends on the batch size 𝐵, egress bandwidth 𝑊 and accelerator speed 𝐶, and is not dependant on the model size.
+
