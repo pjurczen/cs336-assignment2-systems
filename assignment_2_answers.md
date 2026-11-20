@@ -701,15 +701,20 @@ The time for this algorithm is (N-1) × S/W because at every step we send the fu
 
 **(a)**
 
-- 𝒅𝒛 = 𝒅𝒚 𝑾𝟑⊤: (𝐵/𝑁DP, D) × (𝐷FF, 𝐷)⊤ => 2 × 𝐵/𝑁DP × D × 𝐷FF
+- 𝒅𝒛 = 𝒅𝒚 𝑾𝟑⊤: (𝐵/𝑁DP, 𝐷) × (𝐷FF, 𝐷)⊤ => 2 × 𝐵/𝑁DP × 𝐷 × 𝐷FF
 - 𝒅𝒙𝟐 = 𝒅𝒛 ∗ 𝑓(𝒙𝟏)
 - 𝒅𝒙𝟏 = 𝒅𝒛 ∗ 𝑓′(𝒙𝟏) ∗ 𝒙𝟐
 - 𝒅𝒙 = 𝒅𝒙𝟏 𝑾𝟏⊤ + 𝒅𝒙𝟐 𝑾𝟐⊤: (𝐵/𝑁DP, 𝐷FF) × (𝐷, 𝐷FF)⊤ + (𝐵/𝑁DP, 𝐷FF) × (𝐷, 𝐷FF)⊤ => 2 × 𝐵/𝑁DP × 𝐷FF × 𝐷 + 2 × 𝐵/𝑁DP × 𝐷FF × 𝐷 = 4 × 𝐵/𝑁DP × 𝐷FF × 𝐷
-- 𝒅𝑾𝟑 = 𝒛⊤ 𝒅𝒚: (𝐵/𝑁DP, 𝐷FF)⊤ × (𝐵/𝑁DP, D) => 2 × 𝐷FF × 𝐵/𝑁DP × D
-- 𝒅𝑾𝟐 = 𝒙⊤ 𝒅𝒙𝟐: (𝐵/𝑁DP, D)⊤ × (𝐵/𝑁DP, 𝐷FF) => 2 × D × 𝐵/𝑁DP × 𝐷FF
-- 𝒅𝑾𝟏 = 𝒙⊤ 𝒅𝒙𝟏: (𝐵/𝑁DP, D)⊤ × (𝐵/𝑁DP, 𝐷FF) => 2 × D × 𝐵/𝑁DP × 𝐷FF
+- 𝒅𝑾𝟑 = 𝒛⊤ 𝒅𝒚: (𝐵/𝑁DP, 𝐷FF)⊤ × (𝐵/𝑁DP, D) => 2 × 𝐷FF × 𝐵/𝑁DP × 𝐷
+- 𝒅𝑾𝟐 = 𝒙⊤ 𝒅𝒙𝟐: (𝐵/𝑁DP, 𝐷)⊤ × (𝐵/𝑁DP, 𝐷FF) => 2 × 𝐷 × 𝐵/𝑁DP × 𝐷FF
+- 𝒅𝑾𝟏 = 𝒙⊤ 𝒅𝒙𝟏: (𝐵/𝑁DP, 𝐷)⊤ × (𝐵/𝑁DP, 𝐷FF) => 2 × 𝐷 × 𝐵/𝑁DP × 𝐷FF
 
-Total: 2 × 𝐵/𝑁DP × D × 𝐷FF + 4 × 𝐵/𝑁DP × 𝐷FF × 𝐷 + 2 × 𝐷FF × 𝐵/𝑁DP × D + 2 × D × 𝐵/𝑁DP × 𝐷FF + 2 × D × 𝐵/𝑁DP × 𝐷FF =
-= 12 × 𝐵/𝑁DP × D × 𝐷FF
+Total: 2 × 𝐵/𝑁DP × 𝐷 × 𝐷FF + 4 × 𝐵/𝑁DP × 𝐷FF × 𝐷 + 2 × 𝐷FF × 𝐵/𝑁DP × 𝐷 + 2 × 𝐷 × 𝐵/𝑁DP × 𝐷FF + 2 × 𝐷 × 𝐵/𝑁DP × 𝐷FF =
+= 12 × 𝐵/𝑁DP × 𝐷 × 𝐷FF
 
 Because each matmul is gonna be ran for 𝐵/𝑁DP shard only, 6 matmuls each costing 2 × 𝐵/𝑁DP × 𝐷 × 𝐷FF.
+
+**(b)**
+
+Each all-reduce costs 2 (𝑁 − 1)/𝑁 × 𝑆/𝑊 seconds, our S for each of 𝒅𝑾1, 𝒅𝑾𝟐 and 𝒅𝑾3 is 𝐷FF × 𝐷 × 2 bytes, so for 𝑁DP devices it will cost us:
+6 × (𝑁DP − 1)/𝑁DP × 𝐷FF × 𝐷 × 2 / 𝑊 seconds to do the necessary all-reduces.
